@@ -1594,8 +1594,10 @@ const Player = {
     const hasList = !!(this.playlist && this.playlist.videoIds.length > 1);
     this.root.innerHTML = `
       <div class="absolute inset-0 bg-black overflow-hidden" id="pl-stage">
-        <video id="pl-video" class="absolute inset-0 w-full h-full object-contain bg-black"
-               playsinline webkit-playsinline preload="metadata"></video>
+        <div id="pl-video-wrap" class="absolute inset-0 overflow-hidden">
+          <video id="pl-video" class="absolute inset-0 w-full h-full object-contain bg-black"
+                 playsinline webkit-playsinline preload="metadata"></video>
+        </div>
 
         <div id="pl-gesture" class="gesture-layer absolute inset-0 z-10"></div>
 
@@ -1805,6 +1807,8 @@ const Player = {
     video.addEventListener('loadedmetadata', () => {
       $('#pl-dur', root).textContent = fmtTime(video.duration);
       this.applyResume();
+      /* refit in case the user rotated before the video's intrinsic size was known */
+      if (this.rotation !== 0) this.applyVideoStyles();
     });
     video.addEventListener('timeupdate', () => this.onTime());
     video.addEventListener('progress', () => this.onBuffer());
@@ -1865,38 +1869,61 @@ const Player = {
     this.setupMediaSession();
   },
 
-  /* centralised video styling: applies aspect ratio + rotation */
+  /* centralised video styling: rotates the wrapper, not the video.
+     This is the reliable approach on mobile — mobile browsers render
+     <video> in a hardware layer that doesn't always obey CSS transforms,
+     but a plain <div> wrapper does. */
   applyVideoStyles() {
     const v = this.video;
+    const wrap = this.root && $('#pl-video-wrap', this.root);
     const stage = this.root && $('#pl-stage', this.root);
-    if (!v || !stage) return;
+    if (!v || !wrap || !stage) return;
 
     const r = ((this.rotation % 360) + 360) % 360;
-    const objFit = 'object-' + (this.aspect || 'contain');
+    const fit = this.aspect || 'contain';
 
-    /* clear previously-set inline rotation geometry */
+    /* ---- reset wrapper geometry (all inline, no Tailwind classes) ---- */
+    wrap.style.top = '';
+    wrap.style.left = '';
+    wrap.style.right = '';
+    wrap.style.bottom = '';
+    wrap.style.width = '';
+    wrap.style.height = '';
+    wrap.style.transform = '';
+    wrap.style.transformOrigin = 'center center';
+
+    /* ---- the video always fills the wrapper 1:1 ---- */
+    v.style.position = 'absolute';
+    v.style.top = '0';
+    v.style.left = '0';
+    v.style.right = '';
+    v.style.bottom = '';
+    v.style.width = '100%';
+    v.style.height = '100%';
     v.style.transform = '';
-    v.style.width = '';
-    v.style.height = '';
-    v.style.left = '';
-    v.style.top = '';
+    v.style.transformOrigin = 'center center';
+    v.style.objectFit = fit;
+    v.style.background = '#000';
 
+    /* ---- apply rotation to the wrapper ---- */
     if (r === 90 || r === 270) {
-      /* swap width/height so the rotated video still fills the stage */
       const W = stage.clientWidth;
       const H = stage.clientHeight;
-      v.className = `absolute bg-black ${objFit}`;
-      v.style.top = '50%';
-      v.style.left = '50%';
-      v.style.width = H + 'px';
-      v.style.height = W + 'px';
-      v.style.transform = `translate(-50%, -50%) rotate(${r}deg)`;
+
+      /* the wrapper is sized H × W (swapped), rotated 90°,
+         so its visual footprint exactly matches the stage (W × H).
+         Because the video inside is w-full h-full object-contain,
+         it scales to fill the wrapper maximally — no stretching,
+         no clipping, just small, even bars if the aspect doesn't match. */
+      wrap.style.top = '50%';
+      wrap.style.left = '50%';
+      wrap.style.width = H + 'px';
+      wrap.style.height = W + 'px';
+      wrap.style.transform = `translate(-50%, -50%) rotate(${r}deg)`;
     } else if (r === 180) {
-      v.className = `absolute inset-0 w-full h-full bg-black ${objFit}`;
-      v.style.transform = 'rotate(180deg)';
-    } else {
-      v.className = `absolute inset-0 w-full h-full bg-black ${objFit}`;
+      wrap.style.transform = 'rotate(180deg)';
     }
+    /* r === 0: wrapper keeps its default inset-0 sizing */
   },
 
   applyResume() {
