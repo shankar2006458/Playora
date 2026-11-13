@@ -1408,6 +1408,11 @@ const Player = {
   subtitleUrl: null,
   wakeLock: null,
   _videoId: null,
+  _nextInterval: null,
+  _nextTimeout: null,
+  rotation: 0,
+  _resizeHandler: null,
+  _carryLock: false,
 
   close() {
     this.token++;
@@ -1420,7 +1425,15 @@ const Player = {
     clearTimeout(this.hideTimer);
     clearInterval(this.saveTimer);
     clearTimeout(this.sleepTimeout);
+    this.clearNextCountdown();
     this.releaseWakeLock();
+    this.rotation = 0;
+    if (this._resizeHandler) {
+      window.removeEventListener('resize', this._resizeHandler);
+      window.removeEventListener('orientationchange', this._resizeHandler);
+      this._resizeHandler = null;
+    }
+    this._carryLock = false;
     if (this.root) { this.root.classList.add('hidden'); this.root.innerHTML = ''; }
     this.isOpen = false;
     this.rec = null;
@@ -1437,6 +1450,11 @@ const Player = {
       try { await this.video.play(); } catch (_) {}
       return;
     }
+
+    /* remember the carry flag before close() wipes it */
+    const carryLock = !!this._carryLock;
+    this._carryLock = false;
+
     this.close();
     const myToken = ++this.token;
 
@@ -1475,6 +1493,7 @@ const Player = {
     this.objectUrl = URL.createObjectURL(file);
     this.buildUI();
     this.attach();
+    if (carryLock) this.setLocked(true);   /* lock carries over from the previous video */
     await this.play();
   },
 
@@ -1635,6 +1654,7 @@ const Player = {
           <button data-pact="toggle" class="pointer-events-auto w-16 h-16 md:w-[68px] md:h-[68px] grid place-items-center rounded-full bg-white/12 backdrop-blur-md text-white hover:bg-white/20 transition active:scale-95">
             <span data-state="play"><i data-lucide="play" class="w-7 h-7 fill-white translate-x-[1px]"></i></span>
             <span data-state="pause" class="hidden"><i data-lucide="pause" class="w-7 h-7 fill-white"></i></span>
+            <span data-state="replay" class="hidden"><i data-lucide="rotate-ccw" class="w-7 h-7"></i></span>
           </button>
           <button data-pact="fwd10" class="pointer-events-auto relative w-12 h-12 grid place-items-center rounded-full bg-black/35 backdrop-blur text-white/90 hover:bg-black/55 transition" title="Skip forward">
             <i data-lucide="rotate-cw" class="w-6 h-6"></i>
@@ -1658,6 +1678,7 @@ const Player = {
               <button data-pact="toggle" class="w-9 h-9 grid place-items-center rounded-full text-white/85 hover:bg-white/10 transition">
                 <span data-state="play"><i data-lucide="play" class="w-[18px] h-[18px] fill-white"></i></span>
                 <span data-state="pause" class="hidden"><i data-lucide="pause" class="w-[18px] h-[18px] fill-white"></i></span>
+                <span data-state="replay" class="hidden"><i data-lucide="rotate-ccw" class="w-[18px] h-[18px]"></i></span>
               </button>
               <div class="flex items-center gap-1.5 text-[11.5px] tabular-nums text-white/75 mr-1">
                 <span id="pl-cur">0:00</span>
@@ -1676,6 +1697,9 @@ const Player = {
 
               <button data-pact="speed" class="h-8 px-2.5 rounded-lg text-[12px] font-medium text-white/85 hover:bg-white/10 transition tabular-nums">
                 <span id="pl-speed-label">1x</span>
+              </button>
+              <button data-pact="rotate" class="w-9 h-9 grid place-items-center rounded-full text-white/60 hover:text-white hover:bg-white/10 transition" title="Rotate video">
+                <i data-lucide="rotate-cw" class="w-[18px] h-[18px]"></i>
               </button>
               <button data-pact="repeat" class="w-9 h-9 grid place-items-center rounded-full text-white/60 hover:bg-white/10 transition" title="Repeat">
                 <i data-lucide="repeat" class="w-[18px] h-[18px]"></i>
@@ -1696,6 +1720,67 @@ const Player = {
             <i data-lucide="lock" class="w-5 h-5"></i>
           </button>
         </div>
+
+        <!-- NEXT-UP COUNTDOWN -->
+        <div id="pl-next-overlay" class="hidden absolute inset-0 z-[45] flex items-end md:items-center justify-center bg-black/60 backdrop-in">
+          <div class="absolute inset-0" data-pact="next-cancel"></div>
+
+          <div class="relative w-[calc(100%-1.5rem)] md:w-[min(440px,90vw)] mb-[max(16px,env(safe-area-inset-bottom))] md:mb-0 rounded-2xl border border-line/60 bg-panel/95 backdrop-blur-2xl shadow-2xl shadow-black/70 overflow-hidden sheet-in">
+
+            <!-- accent glow line -->
+            <div class="absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-accent to-transparent"></div>
+
+            <div class="p-4 md:p-5">
+
+              <!-- eyebrow row -->
+              <div class="flex items-center justify-between mb-3">
+                <div class="flex items-center gap-1.5">
+                  <span class="w-1.5 h-1.5 rounded-full bg-accent animate-pulse"></span>
+                  <p class="text-[10px] uppercase tracking-[0.18em] text-accent font-bold">Up next</p>
+                </div>
+                <p id="pl-next-pos" class="text-[10px] uppercase tracking-wider text-muted/70 font-medium tabular-nums"></p>
+              </div>
+
+              <!-- main row: thumb · title · ring -->
+              <div class="flex items-center gap-3.5 mb-4">
+                <div id="pl-next-thumb-wrap"
+                     class="relative w-[72px] h-[72px] rounded-xl overflow-hidden bg-black ring-1 ring-white/10 shrink-0"></div>
+
+                <div class="min-w-0 flex-1">
+                  <p id="pl-next-title" class="text-[14px] md:text-[15px] font-semibold leading-snug line-clamp-2 text-white/95"></p>
+                  <p id="pl-next-meta" class="text-[11px] text-muted mt-1 tabular-nums"></p>
+                </div>
+
+                <!-- circular countdown ring -->
+                <div class="relative w-14 h-14 shrink-0">
+                  <svg class="absolute inset-0 w-full h-full -rotate-90 text-accent" viewBox="0 0 56 56" aria-hidden="true">
+                    <circle cx="28" cy="28" r="24" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="3"></circle>
+                    <circle id="pl-next-ring" cx="28" cy="28" r="24" fill="none"
+                            stroke="currentColor" stroke-width="3" stroke-linecap="round"
+                            stroke-dasharray="150.796" stroke-dashoffset="0"
+                            style="transition: stroke-dashoffset .1s linear;"></circle>
+                  </svg>
+                  <div class="absolute inset-0 grid place-items-center">
+                    <span id="pl-next-count" class="text-[17px] font-bold tabular-nums text-white">5</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- action buttons -->
+              <div class="flex gap-2">
+                <button data-pact="next-cancel"
+                  class="flex-1 h-11 rounded-xl border border-line/80 text-[12.5px] font-medium text-white/75 hover:bg-white/[0.05] hover:text-white hover:border-line transition active:scale-[0.99]">
+                  Cancel
+                </button>
+                <button data-pact="next-skip"
+                  class="flex-[1.4] h-11 rounded-xl bg-accent hover:bg-accent2 text-[12.5px] font-semibold text-white transition flex items-center justify-center gap-1.5 shadow-lg shadow-accent/25 active:scale-[0.99]">
+                  <i data-lucide="play" class="w-3.5 h-3.5 fill-white translate-x-[1px]"></i>
+                  Play now
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>`;
     icons();
   },
@@ -1705,6 +1790,16 @@ const Player = {
     const video = $('#pl-video', root);
     this.video = video;
     video.src = this.objectUrl;
+
+    /* apply initial aspect/rotation (aspect defaults to "contain", rotation 0) */
+    this.applyVideoStyles();
+
+    /* re-apply rotation geometry when the viewport or orientation changes */
+    this._resizeHandler = () => {
+      if (this.video && this.rotation) this.applyVideoStyles();
+    };
+    window.addEventListener('resize', this._resizeHandler);
+    window.addEventListener('orientationchange', this._resizeHandler);
 
     /* -------- media events -------- */
     video.addEventListener('loadedmetadata', () => {
@@ -1716,6 +1811,7 @@ const Player = {
     video.addEventListener('play',  () => { this.syncPlayIcons(); this.scheduleHide(); this.acquireWakeLock(); this.startSaveLoop(); });
     video.addEventListener('pause', () => { this.syncPlayIcons(); this.showControls(); this.stopSaveLoop(); this.saveProgress(); this.releaseWakeLock(); });
     video.addEventListener('ended', () => this.onEnded());
+    video.addEventListener('seeked', () => this.syncPlayIcons());
     video.addEventListener('error', () => {
       this.stopSaveLoop();
       this.renderError('This video could not be decoded by your browser.');
@@ -1769,6 +1865,40 @@ const Player = {
     this.setupMediaSession();
   },
 
+  /* centralised video styling: applies aspect ratio + rotation */
+  applyVideoStyles() {
+    const v = this.video;
+    const stage = this.root && $('#pl-stage', this.root);
+    if (!v || !stage) return;
+
+    const r = ((this.rotation % 360) + 360) % 360;
+    const objFit = 'object-' + (this.aspect || 'contain');
+
+    /* clear previously-set inline rotation geometry */
+    v.style.transform = '';
+    v.style.width = '';
+    v.style.height = '';
+    v.style.left = '';
+    v.style.top = '';
+
+    if (r === 90 || r === 270) {
+      /* swap width/height so the rotated video still fills the stage */
+      const W = stage.clientWidth;
+      const H = stage.clientHeight;
+      v.className = `absolute bg-black ${objFit}`;
+      v.style.top = '50%';
+      v.style.left = '50%';
+      v.style.width = H + 'px';
+      v.style.height = W + 'px';
+      v.style.transform = `translate(-50%, -50%) rotate(${r}deg)`;
+    } else if (r === 180) {
+      v.className = `absolute inset-0 w-full h-full bg-black ${objFit}`;
+      v.style.transform = 'rotate(180deg)';
+    } else {
+      v.className = `absolute inset-0 w-full h-full bg-black ${objFit}`;
+    }
+  },
+
   applyResume() {
     const rec = this.rec, video = this.video;
     if (!video || !rec) return;
@@ -1793,11 +1923,36 @@ const Player = {
     const video = this.video;
     switch (name) {
       case 'back': this.goBack(); break;
-      case 'toggle': video.paused ? this.play() : video.pause(); break;
+      case 'toggle':
+        if (this.isAtEnd()) {
+          /* replay: rewind to the start, then play */
+          try { video.currentTime = 0; } catch (_) {}
+          this.syncPlayIcons();
+          this.play();
+          this.indicate('Replaying');
+        } else {
+          video.paused ? this.play() : video.pause();
+        }
+        break;
       case 'back10': this.seekBy(-state.settings.skipInterval); break;
       case 'fwd10': this.seekBy(state.settings.skipInterval); break;
       case 'prev': this.step(-1); break;
       case 'next': this.step(1); break;
+      case 'next-cancel':
+        this.clearNextCountdown();
+        this.syncPlayIcons();
+        this.showControls();
+        this.indicate('Autoplay cancelled');
+        break;
+      case 'next-skip':
+        this.clearNextCountdown();
+        this.step(1);
+        break;
+      case 'rotate':
+        this.rotation = ((this.rotation + 90) % 360);
+        this.applyVideoStyles();
+        this.indicate(this.rotation ? `Rotated ${this.rotation}°` : 'Rotation reset');
+        break;
       case 'mute': video.muted = !video.muted; break;
       case 'repeat':
         this.repeat = !this.repeat;
@@ -1814,6 +1969,77 @@ const Player = {
       case 'vmenu': this.openVideoMenu(); break;
       case 'relink': this.relink(); break;
     }
+  },
+
+  showNextCountdown(nextId) {
+    const nextRec = state.videoMap.get(nextId);
+    const el = this.root ? $('#pl-next-overlay', this.root) : null;
+    if (!nextRec || !el) return;
+
+    /* thumbnail */
+    const thumbWrap = $('#pl-next-thumb-wrap', el);
+    if (thumbWrap) {
+      thumbWrap.innerHTML = thumbHTML(nextRec);
+      icons();
+    }
+
+    /* title + meta line */
+    $('#pl-next-title', el).textContent = nextRec.name;
+    const parts = [];
+    if (nextRec.duration) parts.push(fmtTime(nextRec.duration));
+    if (nextRec.size)     parts.push(fmtSize(nextRec.size));
+    $('#pl-next-meta', el).textContent = parts.join(' · ');
+
+    /* playlist position — e.g. "2 / 3" */
+    const posEl = $('#pl-next-pos', el);
+    if (posEl) {
+      if (this.playlist && this.playlist.videoIds.length) {
+        posEl.textContent = `${this.index + 2} / ${this.playlist.videoIds.length}`;
+      } else {
+        posEl.textContent = '';
+      }
+    }
+
+    /* reset countdown UI */
+    const countEl = $('#pl-next-count', el);
+    const ringEl  = $('#pl-next-ring', el);
+    if (countEl) countEl.textContent = '5';
+    if (ringEl)  ringEl.style.strokeDashoffset = '0';
+
+    el.classList.remove('hidden');
+
+    /* drive the 5 s timer — updates at 50 ms for a smooth ring sweep */
+    const total  = 5000;
+    const startAt = Date.now();
+    const CIRC   = 150.796;            // 2 * π * 24 (r=24 in the SVG)
+
+    clearInterval(this._nextInterval);
+    clearTimeout(this._nextTimeout);
+
+    this._nextInterval = setInterval(() => {
+      const elapsed   = Date.now() - startAt;
+      const remaining = Math.max(0, total - elapsed);
+      const ratio     = remaining / total;
+      const count     = Math.max(1, Math.ceil(remaining / 1000));
+
+      if (countEl) countEl.textContent = String(count);
+      if (ringEl)  ringEl.style.strokeDashoffset = String(CIRC * (1 - ratio));
+    }, 50);
+
+    this._nextTimeout = setTimeout(() => {
+      this.clearNextCountdown();
+      this.step(1);
+    }, total);
+  },
+
+  clearNextCountdown() {
+    clearInterval(this._nextInterval);
+    clearTimeout(this._nextTimeout);
+    this._nextInterval = null;
+    this._nextTimeout = null;
+    if (!this.root) return;
+    const el = $('#pl-next-overlay', this.root);
+    if (el) el.classList.add('hidden');
   },
 
   setLocked(v) {
@@ -1846,6 +2072,7 @@ const Player = {
     const id = ids[next];
     const plId = this.playlist.id;                 // save before close() clears it
     this.returnTo = this.returnTo || '#/library';
+    this._carryLock = !!this.locked;               // remember lock across the hash change
     location.hash = '#/player/' + id + '?list=' + plId;
   },
 
@@ -1879,15 +2106,27 @@ const Player = {
     if (buf) buf.style.width = clamp((end / video.duration) * 100, 0, 100) + '%';
   },
 
-  onEnded() {
-    this.saveProgress(true);
-    if (this.repeat) return;
-    if (this.playlist) {
-      const ids = this.playlist.videoIds;
-      if (this.index >= 0 && this.index < ids.length - 1) { this.step(1); return; }
+onEnded() {
+  this.saveProgress(true);
+
+  if (this.repeat) return;
+
+  if (this.playlist) {
+    const ids = this.playlist.videoIds;
+    if (this.index >= 0 && this.index < ids.length - 1) {
+      const nextId = ids[this.index + 1];
+
+      this.syncPlayIcons();
+      this.showControls();          /* no-op when locked — keeps controls hidden */
+      this.showNextCountdown(nextId);
+      return;
     }
-    this.showControls();
-  },
+  }
+
+  /* last video of a playlist, or standalone video — show replay icon */
+  this.syncPlayIcons();
+  this.showControls();
+},
 
   bindSeek() {
     const bar = $('#pl-seek', this.root);
@@ -2116,10 +2355,28 @@ const Player = {
     this.hideTimer = setTimeout(() => this.hideControls(), 3000);
   },
 
+  /* true when the video has finished (or is parked exactly on the last frame) */
+  isAtEnd() {
+    const v = this.video;
+    if (!v) return false;
+    if (v.ended) return true;
+    /* safety net: some browsers set the `ended` flag a frame after `pause`,
+       which would flash the play icon. Treat "paused at the very end" as ended. */
+    return !!(v.paused && isFinite(v.duration) && v.duration > 0 &&
+              v.currentTime >= v.duration - 0.15);
+  },
+
   syncPlayIcons() {
     const paused = !this.video || this.video.paused;
-    $$('[data-state="play"]', this.root).forEach(n => n.classList.toggle('hidden', !paused));
-    $$('[data-state="pause"]', this.root).forEach(n => n.classList.toggle('hidden', paused));
+    const ended  = this.isAtEnd();
+
+    const showPlay   = paused && !ended;
+    const showPause  = !paused;
+    const showReplay = paused && ended;
+
+    $$('[data-state="play"]',   this.root).forEach(n => n.classList.toggle('hidden', !showPlay));
+    $$('[data-state="pause"]',  this.root).forEach(n => n.classList.toggle('hidden', !showPause));
+    $$('[data-state="replay"]', this.root).forEach(n => n.classList.toggle('hidden', !showReplay));
   },
 
   async toggleFullscreen() {
@@ -2263,6 +2520,13 @@ const Player = {
             </div>
           </div>
 
+          <div>
+            <p class="text-[11px] uppercase tracking-wider text-muted font-medium mb-2">Rotate video</p>
+            <div class="flex flex-wrap gap-1.5" data-rotations>
+              ${[0, 90, 180, 270].map(r => `<button data-rotation="${r}" class="h-9 px-3 rounded-lg text-[12.5px] font-medium border transition ${this.rotation === r ? 'bg-accent border-accent text-white' : 'border-line text-white/70 hover:bg-white/[0.06]'}">${r}°</button>`).join('')}
+            </div>
+          </div>
+
           <div class="space-y-1">
             <button data-sheet-action="subtitles" class="w-full flex items-center gap-3 px-1 py-2.5 rounded-lg hover:bg-white/[0.04] transition text-left">
               <i data-lucide="subtitles" class="w-4 h-4 text-white/60"></i>
@@ -2319,11 +2583,24 @@ const Player = {
       btn.addEventListener('click', () => {
         const a = btn.dataset.aspect;
         this.aspect = a;
-        this.video.className = `absolute inset-0 w-full h-full bg-black object-${a}`;
+        this.applyVideoStyles();   /* respect current rotation */
         wrap.querySelectorAll('[data-aspect]').forEach(b => {
           const on = b.dataset.aspect === a;
           b.className = `h-9 px-3 rounded-lg text-[12.5px] font-medium border transition ${on ? 'bg-accent border-accent text-white' : 'border-line text-white/70 hover:bg-white/[0.06]'}`;
         });
+      });
+    });
+
+    wrap.querySelectorAll('[data-rotation]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const r = Number(btn.dataset.rotation);
+        this.rotation = r;
+        this.applyVideoStyles();
+        wrap.querySelectorAll('[data-rotation]').forEach(b => {
+          const on = Number(b.dataset.rotation) === r;
+          b.className = `h-9 px-3 rounded-lg text-[12.5px] font-medium border transition ${on ? 'bg-accent border-accent text-white' : 'border-line text-white/70 hover:bg-white/[0.06]'}`;
+        });
+        this.indicate(r ? `Rotated ${r}°` : 'Rotation reset');
       });
     });
 
@@ -3811,6 +4088,7 @@ document.addEventListener('keydown', (e) => {
     case ' ':
     case 'k':
       e.preventDefault();
+      if (Player._nextTimeout) Player.clearNextCountdown();
       v.paused ? Player.play() : v.pause();
       break;
     case 'ArrowLeft':
@@ -3859,6 +4137,10 @@ document.addEventListener('fullscreenchange', () => {
   if (icon) {
     icon.setAttribute('data-lucide', document.fullscreenElement ? 'minimize' : 'maximize');
     icons();
+  }
+  /* stage dimensions change when entering/leaving fullscreen */
+  if (Player.isOpen) {
+    requestAnimationFrame(() => Player.applyVideoStyles());
   }
 });
 
