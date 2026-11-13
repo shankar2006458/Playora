@@ -96,6 +96,20 @@
   @media (prefers-reduced-motion: reduce) {
     * { animation: none !important; transition: none !important; }
   }
+
+  /* bulk-select: extra bottom padding so cards aren't hidden behind the action bar */
+  body.bulk-active #view { padding-bottom: calc(88px + env(safe-area-inset-bottom)) !important; }
+  @media (min-width: 768px) {
+    body.bulk-active #view { padding-bottom: 88px !important; }
+  }
+  #bulk-bar { transition: transform .2s ease, opacity .2s ease; }
+
+  /* long-press friendly cards — no text selection, no iOS callout, no tap flash */
+  [data-bulk-id] {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
 </style>
 </head>
 <body class="bg-bg text-white antialiased">
@@ -126,6 +140,9 @@
 
   <!-- ================= MOBILE BOTTOM NAV ================= -->
   <nav id="bottom-nav" class="md:hidden fixed bottom-0 inset-x-0 z-40 border-t border-line bg-surface/95 backdrop-blur-xl pb-[env(safe-area-inset-bottom)]"></nav>
+
+  <!-- ================= BULK-SELECT ACTION BAR ================= -->
+  <div id="bulk-bar" class="hidden fixed bottom-0 inset-x-0 z-[45] border-t border-line bg-panel/95 backdrop-blur-xl pb-[env(safe-area-inset-bottom)] md:pl-[248px]"></div>
 
 </div>
 
@@ -262,6 +279,8 @@ const state = {
 
 const libState = { search: '', sort: 'added-desc', layout: 'grid', filter: 'all' };
 const favState = { search: '' };
+const bulkState = { active: false, selected: new Set() };
+const longPressState = { timer: null, fired: false, startX: 0, startY: 0 };
 
 function loadSettings() {
   try {
@@ -676,6 +695,52 @@ function captureThumb(url, duration) {
 }
 
 /* ------------------------------ import flow ----------------------------- */
+function isDuplicate(file) {
+  return state.videos.find(v =>
+    v.originalName === file.name && v.size === file.size
+  );
+}
+
+async function promptDuplicates(dupes, totalCount) {
+  return new Promise(resolve => {
+    openModal({
+      title: `${dupes.length} duplicate${dupes.length > 1 ? 's' : ''} found`,
+      body: `
+        <div class="flex items-start gap-3 mb-3">
+          <div class="w-10 h-10 rounded-xl bg-amber-500/10 border border-amber-500/20 grid place-items-center shrink-0">
+            <i data-lucide="alert-triangle" class="w-5 h-5 text-amber-400"></i>
+          </div>
+          <div class="min-w-0">
+            <p class="text-[13px] font-medium">${dupes.length} of ${totalCount} file${totalCount > 1 ? 's' : ''} already exist${dupes.length > 1 ? '' : 's'} in your library.</p>
+            <p class="text-[11.5px] text-muted mt-1">Duplicates are matched by exact file name and size.</p>
+          </div>
+        </div>
+        <div class="space-y-1 max-h-[30vh] overflow-y-auto no-sb rounded-lg border border-line/60 bg-surface/50 p-2">
+          ${dupes.slice(0, 6).map(f => `
+            <div class="flex items-center gap-2 text-[11.5px] text-white/70 py-1">
+              <i data-lucide="file-video" class="w-3.5 h-3.5 text-amber-400/70 shrink-0"></i>
+              <span class="truncate flex-1">${esc(f.name)}</span>
+              <span class="text-muted tabular-nums shrink-0">${fmtSize(f.size)}</span>
+            </div>`).join('')}
+          ${dupes.length > 6 ? `<p class="text-[11px] text-muted pt-1">+ ${dupes.length - 6} more…</p>` : ''}
+        </div>`,
+      footer: `
+        <div class="flex gap-2.5">
+          <button data-cancel class="flex-1 h-11 rounded-xl border border-line text-[13px] font-medium text-white/80 hover:bg-white/[0.05] transition">
+            Import all
+          </button>
+          <button data-skip class="flex-1 h-11 rounded-xl bg-accent hover:bg-accent2 text-[13px] font-semibold text-white transition">
+            Skip duplicates
+          </button>
+        </div>`,
+      onMount(root, done) {
+        root.querySelector('[data-cancel]').addEventListener('click', () => done('all'));
+        root.querySelector('[data-skip]').addEventListener('click', () => done('skip'));
+      }
+    }).then(resolve);
+  });
+}
+
 function ensureStoragePersisted() {
   try {
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
@@ -751,48 +816,94 @@ function hideImportBar() {
 async function importFromHandleList(handles) {
   if (!handles || !handles.length) return;
   ensureStoragePersisted();
+
+  /* read files first so we can scan for duplicates */
+  importBar();
+  const files = [];
+  for (let i = 0; i < handles.length; i++) {
+    try {
+      const f = await handles[i].getFile();
+      if (isVideoFile(f)) files.push({ file: f, handle: handles[i] });
+    } catch (_) {}
+    updateImportBar(i + 1, handles.length, 'Reading files…');
+  }
+  hideImportBar();
+  if (!files.length) { toast('No supported video files selected', 'error'); return; }
+
+  const dupes = files.filter(({ file }) => isDuplicate(file));
+  let toImport = files;
+  let skippedDupes = 0;
+  if (dupes.length > 0) {
+    const choice = await promptDuplicates(dupes.map(d => d.file), files.length);
+    if (choice === 'skip') {
+      toImport = files.filter(({ file }) => !isDuplicate(file));
+      skippedDupes = files.length - toImport.length;
+    }
+  }
+  if (!toImport.length) {
+    toast(`All ${files.length} file${files.length > 1 ? 's are' : ' is'} already in your library`);
+    return;
+  }
+
   importBar();
   let ok = 0, failed = 0;
-  for (let i = 0; i < handles.length; i++) {
-    const h = handles[i];
-    updateImportBar(i, handles.length, 'Importing ' + (h.name || 'video'));
+  for (let i = 0; i < toImport.length; i++) {
+    const { file, handle } = toImport[i];
+    updateImportBar(i, toImport.length, 'Importing ' + file.name);
     try {
-      const file = await h.getFile();
-      if (!isVideoFile(file)) { failed++; continue; }
-      await importFileRecord(file, h);
+      await importFileRecord(file, handle);
       ok++;
     } catch (err) {
       failed++;
       console.warn('Import failed', err);
     }
-    updateImportBar(i + 1, handles.length);
+    updateImportBar(i + 1, toImport.length);
   }
   hideImportBar();
   await loadAll();
+  if (skippedDupes > 0) toast(`${skippedDupes} duplicate${skippedDupes > 1 ? 's' : ''} skipped`);
   finishImport(ok, failed);
 }
 
 async function importFromFiles(fileList) {
   const files = Array.from(fileList || []).filter(isVideoFile);
   if (!files.length) { toast('No supported video files selected', 'error'); return; }
+
+  /* ---- duplicate detection ---- */
+  const dupes = files.filter(f => isDuplicate(f));
+  let toImport = files;
+  let skippedDupes = 0;
+  if (dupes.length > 0) {
+    const choice = await promptDuplicates(dupes, files.length);
+    if (choice === 'skip') {
+      toImport = files.filter(f => !isDuplicate(f));
+      skippedDupes = files.length - toImport.length;
+    }
+  }
+  if (!toImport.length) {
+    toast(`All ${files.length} file${files.length > 1 ? 's are' : ' is'} already in your library`);
+    return;
+  }
+
   ensureStoragePersisted();
   importBar();
   let ok = 0, failed = 0, quota = false;
-  for (let i = 0; i < files.length; i++) {
-    updateImportBar(i, files.length, 'Importing ' + files[i].name);
+  for (let i = 0; i < toImport.length; i++) {
+    updateImportBar(i, toImport.length, 'Importing ' + toImport[i].name);
     try {
-      await importFileRecord(files[i], null);
+      await importFileRecord(toImport[i], null);
       ok++;
     } catch (err) {
       failed++;
       if (err && err.message === 'storage') quota = true;
       console.warn('Import failed', err);
     }
-    updateImportBar(i + 1, files.length);
+    updateImportBar(i + 1, toImport.length);
   }
   hideImportBar();
   await loadAll();
   if (quota) toast('Browser storage is full — some videos could not be saved', 'error', 5000);
+  if (skippedDupes > 0) toast(`${skippedDupes} duplicate${skippedDupes > 1 ? 's' : ''} skipped`);
   finishImport(ok, failed);
 }
 
@@ -874,57 +985,85 @@ function videoCardGrid(v) {
   const pct = progressOf(v);
   const isFav = state.favMap.has(v.id);
   const isDone = !!(h && h.completed);
+  const bulk = bulkState.active;
+  const selected = bulk && bulkState.selected.has(v.id);
+
   return `
-    <div class="group" data-vid="${v.id}">
-      <div class="relative aspect-video rounded-xl overflow-hidden bg-[#15151a] cursor-pointer ring-1 ring-white/[0.04]"
-           data-action="play" data-id="${v.id}">
+    <div class="group" data-vid="${v.id}" data-bulk-id="${v.id}">
+      <div class="relative aspect-video rounded-xl overflow-hidden bg-[#15151a] ring-1 transition-all duration-150
+                  ${bulk ? '' : 'cursor-pointer'}
+                  ${selected ? 'ring-2 ring-accent' : 'ring-white/[0.04]'}"
+           ${bulk ? '' : `data-action="play" data-id="${v.id}"`}>
         ${thumbHTML(v)}
-        <div class="absolute inset-0 bg-gradient-to-t from-black/40 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition"></div>
-        <span class="absolute bottom-1.5 right-1.5 px-1.5 py-[2px] rounded-md bg-black/80 text-[10.5px] font-medium tabular-nums text-white/90">
-          ${fmtTime(v.duration)}
-        </span>
-        ${isFav ? `<span class="absolute top-1.5 left-1.5 w-6 h-6 grid place-items-center rounded-full bg-black/60"><i data-lucide="heart" class="w-3 h-3 text-red-400 fill-red-400"></i></span>` : ''}
-        ${isDone ? `<span class="absolute top-1.5 right-1.5 w-6 h-6 grid place-items-center rounded-full bg-black/60 backdrop-blur"><i data-lucide="check" class="w-3.5 h-3.5 text-emerald-400"></i></span>` : ''}
-        ${pct > 0.5 && !isDone ? `<div class="absolute left-0 right-0 bottom-0 h-[3px] bg-white/20"><div class="h-full bg-accent" style="width:${pct}%"></div></div>` : ''}
-        <div class="absolute inset-0 grid place-items-center opacity-0 group-hover:opacity-100 transition">
-          <span class="w-11 h-11 rounded-full bg-black/55 backdrop-blur grid place-items-center">
-            <i data-lucide="play" class="w-5 h-5 text-white fill-white translate-x-[1px]"></i>
+
+        ${bulk ? `
+          <div class="absolute inset-0 ${selected ? 'bg-accent/20' : 'bg-black/20'} transition"></div>
+          <span class="absolute top-2 left-2 w-7 h-7 rounded-full grid place-items-center transition-all
+                       ${selected ? 'bg-accent shadow-lg shadow-accent/40 scale-105' : 'bg-black/50 backdrop-blur border-2 border-white/70'}">
+            ${selected ? '<i data-lucide="check" class="w-4 h-4 text-white"></i>' : ''}
           </span>
-        </div>
+        ` : `
+          <div class="absolute inset-0 bg-gradient-to-t from-black/40 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition"></div>
+          <span class="absolute bottom-1.5 right-1.5 px-1.5 py-[2px] rounded-md bg-black/80 text-[10.5px] font-medium tabular-nums text-white/90">
+            ${fmtTime(v.duration)}
+          </span>
+          ${isFav ? `<span class="absolute top-1.5 left-1.5 w-6 h-6 grid place-items-center rounded-full bg-black/60"><i data-lucide="heart" class="w-3 h-3 text-red-400 fill-red-400"></i></span>` : ''}
+          ${isDone ? `<span class="absolute top-1.5 right-1.5 w-6 h-6 grid place-items-center rounded-full bg-black/60 backdrop-blur"><i data-lucide="check" class="w-3.5 h-3.5 text-emerald-400"></i></span>` : ''}
+          ${pct > 0.5 && !isDone ? `<div class="absolute left-0 right-0 bottom-0 h-[3px] bg-white/20"><div class="h-full bg-accent" style="width:${pct}%"></div></div>` : ''}
+          <div class="absolute inset-0 grid place-items-center opacity-0 group-hover:opacity-100 transition">
+            <span class="w-11 h-11 rounded-full bg-black/55 backdrop-blur grid place-items-center">
+              <i data-lucide="play" class="w-5 h-5 text-white fill-white translate-x-[1px]"></i>
+            </span>
+          </div>
+        `}
       </div>
       <div class="mt-2.5 flex items-start gap-1">
-        <div class="min-w-0 flex-1 cursor-pointer" data-action="play" data-id="${v.id}">
+        <div class="min-w-0 flex-1 ${bulk ? '' : 'cursor-pointer'}"
+             ${bulk ? '' : `data-action="play" data-id="${v.id}"`}>
           <p class="text-[13px] font-medium leading-snug line-clamp-2 text-white/92">${esc(v.name)}</p>
           <p class="mt-1 text-[11px] text-muted truncate">${esc(relDate(v.addedAt))}${v.size ? ' · ' + fmtSize(v.size) : ''}</p>
         </div>
-        <button data-action="vmenu" data-id="${v.id}"
+        ${bulk ? '' : `<button data-action="vmenu" data-id="${v.id}"
           class="w-8 h-8 -mr-1 shrink-0 grid place-items-center rounded-full text-white/45 hover:text-white hover:bg-white/[0.07] transition">
           <i data-lucide="more-vertical" class="w-4 h-4"></i>
-        </button>
+        </button>`}
       </div>
     </div>`;
 }
 
 function videoRow(v) {
   const pct = progressOf(v);
+  const bulk = bulkState.active;
+  const selected = bulk && bulkState.selected.has(v.id);
+
   return `
-    <div class="group flex items-center gap-3 p-2 rounded-xl hover:bg-white/[0.035] transition" data-vid="${v.id}">
-      <div class="relative w-[104px] md:w-[132px] shrink-0 aspect-video rounded-lg overflow-hidden bg-[#15151a] cursor-pointer" data-action="play" data-id="${v.id}">
+    <div class="group flex items-center gap-3 p-2 rounded-xl transition
+                ${selected ? 'bg-accent/10 ring-1 ring-accent/40' : 'hover:bg-white/[0.035]'}"
+         data-vid="${v.id}" data-bulk-id="${v.id}">
+      ${bulk ? `
+        <span class="w-7 h-7 shrink-0 rounded-full grid place-items-center transition
+                     ${selected ? 'bg-accent' : 'bg-black/40 border-2 border-white/40'}">
+          ${selected ? '<i data-lucide="check" class="w-4 h-4 text-white"></i>' : ''}
+        </span>
+      ` : ''}
+      <div class="relative w-[104px] md:w-[132px] shrink-0 aspect-video rounded-lg overflow-hidden bg-[#15151a] ${bulk ? '' : 'cursor-pointer'}"
+           ${bulk ? '' : `data-action="play" data-id="${v.id}"`}>
         ${thumbHTML(v)}
         <span class="absolute bottom-1 right-1 px-1 py-[1px] rounded bg-black/80 text-[10px] font-medium tabular-nums">${fmtTime(v.duration)}</span>
         ${pct > 0.5 ? `<div class="absolute left-0 right-0 bottom-0 h-[2.5px] bg-white/20"><div class="h-full bg-accent" style="width:${pct}%"></div></div>` : ''}
       </div>
-      <div class="min-w-0 flex-1 cursor-pointer" data-action="play" data-id="${v.id}">
+      <div class="min-w-0 flex-1 ${bulk ? '' : 'cursor-pointer'}"
+           ${bulk ? '' : `data-action="play" data-id="${v.id}"`}>
         <p class="text-[13px] font-medium leading-snug truncate">${esc(v.name)}</p>
         <p class="mt-1 text-[11px] text-muted truncate">
           ${fmtTime(v.duration)}${v.size ? ' · ' + fmtSize(v.size) : ''} · ${esc(relDate(v.addedAt))}
         </p>
         ${pct > 0.5 ? `<p class="mt-1 text-[10.5px] text-accent/90">${Math.round(pct)}% watched</p>` : ''}
       </div>
-      <button data-action="vmenu" data-id="${v.id}"
+      ${bulk ? '' : `<button data-action="vmenu" data-id="${v.id}"
         class="w-8 h-8 shrink-0 grid place-items-center rounded-full text-white/45 hover:text-white hover:bg-white/[0.07] transition">
         <i data-lucide="more-vertical" class="w-4 h-4"></i>
-      </button>
+      </button>`}
     </div>`;
 }
 
@@ -1265,11 +1404,13 @@ function renderSortButton() {
 function libSubtitleText() {
   const total = state.videos.length;
   if (total === 0) return 'Empty';
+  const totalSize = state.videos.reduce((s, v) => s + (v.size || 0), 0);
+  const sizeStr = totalSize ? fmtSize(totalSize) : '';
   const list = filteredVideos(libState.search, libState.sort, libState.filter);
   const isFiltering = !!libState.search.trim() || libState.filter !== 'all';
-  if (isFiltering) return `${list.length} of ${total} shown`;
+  if (isFiltering) return `${list.length} of ${total} shown${sizeStr ? ' · ' + sizeStr : ''}`;
   const progress = state.history.filter(h => !h.completed && (h.position || 0) > 3).length;
-  return `${total} video${total === 1 ? '' : 's'}${progress ? ' · ' + progress + ' in progress' : ''}`;
+  return `${total} video${total === 1 ? '' : 's'}${sizeStr ? ' · ' + sizeStr : ''}${progress ? ' · ' + progress + ' in progress' : ''}`;
 }
 
 function filteredVideos(search, sort, filter = 'all') {
@@ -1289,6 +1430,12 @@ function viewLibrary() {
           <h1 class="text-[17px] md:text-[19px] font-semibold tracking-tight leading-none">Library</h1>
           <p id="lib-subtitle" class="text-[10.5px] text-muted leading-none mt-1">${esc(libSubtitleText())}</p>
         </div>
+        <button data-action="bulk-enter"
+          class="h-10 px-3 rounded-full text-[12px] font-medium transition flex items-center gap-1.5 text-white/65 hover:text-white hover:bg-white/[0.07]"
+          title="Select multiple">
+          <i data-lucide="check-square" class="w-[16px] h-[16px]"></i>
+          <span class="hidden sm:inline">Select</span>
+        </button>
         <button data-action="layout" data-layout="${libState.layout === 'grid' ? 'list' : 'grid'}"
           class="w-10 h-10 grid place-items-center rounded-full text-white/65 hover:text-white hover:bg-white/[0.07] transition"
           title="${libState.layout === 'grid' ? 'List view' : 'Grid view'}">
@@ -1318,6 +1465,301 @@ function viewLibrary() {
     <div id="lib-body" class="px-4 md:px-8 py-4"></div>`;
 
   return header;
+}
+
+/* ----------------------------- bulk select ----------------------------- */
+
+/* Long-press to enter bulk-select. Works on both grid cards and list rows
+   across every page (library, home, favorites) — the [data-bulk-id]
+   attribute is the single source of truth. */
+function bindLongPress() {
+  const CANCEL_THRESHOLD = 10;   // px of movement that aborts long-press
+  const LONG_PRESS_MS    = 500;  // how long to hold
+
+  const cancel = () => {
+    clearTimeout(longPressState.timer);
+    longPressState.timer = null;
+  };
+
+  document.addEventListener('pointerdown', (e) => {
+    /* Always clear the stale "just finished a long-press" flag on any
+       new gesture. iOS Safari sometimes suppresses the synthetic click
+       that would normally clear it, leaving it stuck on — which causes
+       the NEXT real tap to be wrongly swallowed by the capture handler. */
+    if (longPressState.fired) longPressState.fired = false;
+
+    /* inside bulk mode, plain taps toggle — no long-press needed */
+    if (bulkState.active) return;
+
+    /* long-press only applies to library view, where bulk mode lives */
+    if (!location.hash.startsWith('#/library')) return;
+
+    /* must be on a card, but not on its ⋮ / play / text buttons */
+    const card = e.target.closest && e.target.closest('[data-bulk-id]');
+    if (!card) return;
+    if (e.target.closest('button, a, input, select, textarea')) return;
+
+    /* ignore right-click / middle-click on desktop */
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+
+    clearTimeout(longPressState.timer);
+    longPressState.fired = false;
+    longPressState.startX = e.clientX;
+    longPressState.startY = e.clientY;
+
+    const id = card.dataset.bulkId;
+    longPressState.timer = setTimeout(() => {
+      longPressState.timer = null;
+      longPressState.fired = true;
+
+      /* tiny haptic tap on supported Androids */
+      try { navigator.vibrate && navigator.vibrate(18); } catch (_) {}
+
+      /* prime the selection BEFORE activating, so the first render already
+         shows the tick — setBulkActive(true) does NOT clear selection. */
+      bulkState.selected.add(id);
+      setBulkActive(true);
+    }, LONG_PRESS_MS);
+  }, { passive: true });
+
+  /* abort as soon as the finger scrolls */
+  document.addEventListener('pointermove', (e) => {
+    if (!longPressState.timer) return;
+    const dx = e.clientX - longPressState.startX;
+    const dy = e.clientY - longPressState.startY;
+    if (Math.hypot(dx, dy) > CANCEL_THRESHOLD) cancel();
+  }, { passive: true });
+
+  document.addEventListener('pointerup',     cancel, { passive: true });
+  document.addEventListener('pointercancel', cancel, { passive: true });
+
+  /* swallow the synthetic click that browsers fire after a long-press,
+     so the tap never turns into "play" or opens the ⋮ menu.
+     Scoped to cards only, so unrelated clicks are never eaten.
+     CAPTURE PHASE — runs before the bubble-phase action handler. */
+  document.addEventListener('click', (e) => {
+    if (!longPressState.fired) return;
+    longPressState.fired = false;
+    const insideCard = !!(e.target.closest && e.target.closest('[data-bulk-id]'));
+    if (!insideCard) return;                    // let unrelated clicks through
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+  }, true);
+
+  /* block the native "Save image / Open link" sheet that mobile browsers
+     show after a long-press on cards */
+  document.addEventListener('contextmenu', (e) => {
+    const card = e.target.closest && e.target.closest('[data-bulk-id]');
+    if (card) e.preventDefault();
+  });
+
+  /* also block long-press drag-out on <img> thumbnails inside cards —
+     otherwise dragging a thumbnail can hijack the gesture and the timer never fires */
+  document.addEventListener('dragstart', (e) => {
+    if (e.target.closest && e.target.closest('[data-bulk-id]')) e.preventDefault();
+  });
+}
+
+function setBulkActive(active) {
+  bulkState.active = active;
+  if (!active) bulkState.selected.clear();
+  document.body.classList.toggle('bulk-active', active);
+
+  /* update the "Select" button in the header */
+  const selectBtn = document.querySelector('[data-action="bulk-enter"]');
+  if (selectBtn) {
+    selectBtn.className = `h-10 px-3 rounded-full text-[12px] font-medium transition flex items-center gap-1.5 ${
+      active ? 'bg-accent text-white' : 'text-white/65 hover:text-white hover:bg-white/[0.07]'
+    }`;
+    selectBtn.title = active ? 'Exit selection' : 'Select multiple';
+    selectBtn.innerHTML = `
+      <i data-lucide="${active ? 'x' : 'check-square'}" class="w-[16px] h-[16px]"></i>
+      <span class="hidden sm:inline">${active ? 'Cancel' : 'Select'}</span>`;
+  }
+
+  const bar = $('#bulk-bar');
+  if (bar) bar.classList.toggle('hidden', !active);
+  const bottomNav = $('#bottom-nav');
+  if (bottomNav) bottomNav.classList.toggle('hidden', active);
+
+  if ($('#lib-body')) {
+    renderLibraryBody();
+    if (active) updateBulkBar();
+  }
+  icons();
+}
+
+function updateBulkBar() {
+  const bar = $('#bulk-bar');
+  if (!bar) return;
+  const count = bulkState.selected.size;
+  const list = filteredVideos(libState.search, libState.sort, libState.filter);
+  const allSelected = list.length > 0 && list.every(v => bulkState.selected.has(v.id));
+
+  bar.innerHTML = `
+    <div class="flex items-center gap-2 px-3 md:px-5 h-16">
+      <button data-bulk-action="cancel"
+        class="w-10 h-10 grid place-items-center rounded-full text-white/65 hover:text-white hover:bg-white/[0.07] transition shrink-0">
+        <i data-lucide="x" class="w-5 h-5"></i>
+      </button>
+      <div class="min-w-0 px-1">
+        <p class="text-[13.5px] font-semibold leading-tight tabular-nums">${count ? count + ' selected' : 'Select videos'}</p>
+        <p class="text-[10.5px] text-muted leading-tight mt-0.5">${count ? 'Tap again to deselect' : 'Tap any video to select'}</p>
+      </div>
+      <div class="flex-1"></div>
+      <button data-bulk-action="select-all"
+        class="h-9 px-3 rounded-lg text-[12px] font-medium border border-line text-white/75 hover:bg-white/[0.06] transition flex items-center gap-1.5">
+        <i data-lucide="${allSelected ? 'x-square' : 'check-square'}" class="w-3.5 h-3.5"></i>
+        <span class="hidden sm:inline">${allSelected ? 'Deselect' : 'Select'} all</span>
+      </button>
+      <div class="h-6 w-px bg-line/80 mx-0.5"></div>
+      <button data-bulk-action="favorite" ${count ? '' : 'disabled'}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-white/85 hover:bg-white/[0.06] transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="heart" class="w-4 h-4"></i>
+        <span class="hidden md:inline">Favorite</span>
+      </button>
+      <button data-bulk-action="playlist" ${count ? '' : 'disabled'}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-white/85 hover:bg-white/[0.06] transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="list-plus" class="w-4 h-4"></i>
+        <span class="hidden md:inline">Playlist</span>
+      </button>
+      <button data-bulk-action="remove" ${count ? '' : 'disabled'}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-red-300 hover:bg-red-500/10 transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="trash-2" class="w-4 h-4"></i>
+        <span class="hidden md:inline">Delete</span>
+      </button>
+    </div>`;
+  icons();
+}
+
+function toggleBulkSelection(id) {
+  if (bulkState.selected.has(id)) bulkState.selected.delete(id);
+  else bulkState.selected.add(id);
+  renderLibraryBody();
+  updateBulkBar();
+}
+
+async function bulkAddToPlaylist(ids) {
+  const list = state.playlists;
+  const body = list.length
+    ? `<p class="text-[12px] text-muted mb-2">Add ${ids.length} video${ids.length > 1 ? 's' : ''} to:</p>
+       <div class="space-y-1 max-h-[46vh] overflow-y-auto no-sb">
+        ${list.map(pl => `
+          <button data-pl="${pl.id}" class="w-full flex items-center gap-3 p-2.5 rounded-xl hover:bg-white/[0.06] transition text-left">
+            <div class="w-9 h-9 rounded-lg bg-surface border border-line grid place-items-center shrink-0">
+              <i data-lucide="list-video" class="w-4 h-4 text-white/40"></i>
+            </div>
+            <div class="min-w-0 flex-1">
+              <p class="text-[13px] font-medium truncate">${esc(pl.name)}</p>
+              <p class="text-[10.5px] text-muted">${pl.videoIds.length} video${pl.videoIds.length === 1 ? '' : 's'}</p>
+            </div>
+            <i data-lucide="chevron-right" class="w-4 h-4 text-white/25"></i>
+          </button>`).join('')}
+       </div>`
+    : `<div class="py-6 text-center"><p class="text-[13px] text-muted">You don't have any playlists yet.</p></div>`;
+
+  openModal({
+    title: 'Add to playlist',
+    body,
+    footer: `<button data-new class="w-full h-11 rounded-xl border border-line text-[13px] font-medium hover:bg-white/[0.05] transition flex items-center justify-center gap-2">
+      <i data-lucide="plus" class="w-4 h-4"></i> New playlist
+    </button>`,
+    onMount(root, done) {
+      root.querySelectorAll('[data-pl]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const pl = state.playlists.find(p => p.id === btn.dataset.pl);
+          if (!pl) return;
+          let added = 0;
+          for (const id of ids) {
+            if (!pl.videoIds.includes(id)) { pl.videoIds.push(id); added++; }
+          }
+          await dbPut('playlists', pl);
+          toast(`Added ${added} video${added === 1 ? '' : 's'} to "${pl.name}"`, 'success');
+          done(true);
+          setBulkActive(false);
+          render();
+        });
+      });
+      root.querySelector('[data-new]').addEventListener('click', async () => {
+        const name = await promptDialog({ title: 'New playlist', label: 'Playlist name', placeholder: 'e.g. Weekend movies', confirmText: 'Create' });
+        if (!name) return;
+        const pl = { id: uid('pl_'), name, createdAt: Date.now(), videoIds: [...ids] };
+        await dbPut('playlists', pl);
+        state.playlists.push(pl);
+        toast(`Playlist created with ${ids.length} video${ids.length === 1 ? '' : 's'}`, 'success');
+        done(true);
+        setBulkActive(false);
+        render();
+      });
+    }
+  });
+}
+
+async function handleBulkAction(action) {
+  if (action === 'cancel') { setBulkActive(false); return; }
+
+  if (action === 'select-all') {
+    const list = filteredVideos(libState.search, libState.sort, libState.filter);
+    const allSelected = list.length > 0 && list.every(v => bulkState.selected.has(v.id));
+    if (allSelected) bulkState.selected.clear();
+    else list.forEach(v => bulkState.selected.add(v.id));
+    renderLibraryBody();
+    updateBulkBar();
+    return;
+  }
+
+  const ids = Array.from(bulkState.selected);
+  if (!ids.length) return;
+
+  if (action === 'favorite') {
+    let added = 0;
+    for (const id of ids) {
+      if (!state.favMap.has(id)) {
+        const rec = { videoId: id, addedAt: Date.now() };
+        await dbPut('favorites', rec);
+        state.favorites.push(rec);
+        state.favMap.set(id, rec);
+        added++;
+      }
+    }
+    toast(`Added ${added} to favorites`, 'success');
+    setBulkActive(false);
+    render();
+  } else if (action === 'playlist') {
+    await bulkAddToPlaylist(ids);
+  } else if (action === 'remove') {
+    const ok = await confirmDialog({
+      title: `Remove ${ids.length} video${ids.length > 1 ? 's' : ''}?`,
+      message: 'They will be removed from your library. Original files stay on your device.',
+      confirmText: 'Remove',
+      danger: true
+    });
+    if (!ok) return;
+    for (const id of ids) {
+      await dbDel('videos', id);
+      await dbDel('files', id).catch(() => {});
+      await dbDel('thumbnails', id).catch(() => {});
+      await dbDel('history', id).catch(() => {});
+      await dbDel('favorites', id).catch(() => {});
+      for (const pl of state.playlists) {
+        if (pl.videoIds.includes(id)) {
+          pl.videoIds = pl.videoIds.filter(x => x !== id);
+          await dbPut('playlists', pl);
+        }
+      }
+      state.videos = state.videos.filter(x => x.id !== id);
+      state.videoMap.delete(id);
+      state.thumbs.delete(id);
+      state.histMap.delete(id);
+      state.favMap.delete(id);
+      state.history = state.history.filter(h => h.videoId !== id);
+      state.favorites = state.favorites.filter(f => f.videoId !== id);
+    }
+    toast(`Removed ${ids.length} video${ids.length > 1 ? 's' : ''}`, 'success');
+    setBulkActive(false);
+    render();
+  }
 }
 
 function renderLibraryBody() {
@@ -3604,6 +4046,17 @@ function render() {
   let view = parts[0] || 'home';
   const param = parts[1] || null;
 
+  /* exit bulk-select if we're no longer on Library */
+  if (bulkState.active && view !== 'library') {
+    bulkState.active = false;
+    bulkState.selected.clear();
+    document.body.classList.remove('bulk-active');
+    const bar = $('#bulk-bar');
+    if (bar) bar.classList.add('hidden');
+    const bottomNav = $('#bottom-nav');
+    if (bottomNav) bottomNav.classList.remove('hidden');
+  }
+
   if (view !== 'player') Player.close();
 
   const viewEl = $('#view');
@@ -3670,12 +4123,32 @@ function bindViewEvents(view) {
 
 /* ---------------------------- global actions ---------------------------- */
 document.addEventListener('click', async (e) => {
+  /* ---- bulk action bar buttons ---- */
+  const bulkAction = e.target.closest('[data-bulk-action]');
+  if (bulkAction) {
+    e.preventDefault();
+    handleBulkAction(bulkAction.dataset.bulkAction);
+    return;
+  }
+  /* ---- in bulk mode, tapping a card toggles it ---- */
+  if (bulkState.active) {
+    const bulkCard = e.target.closest('[data-bulk-id]');
+    if (bulkCard) {
+      e.preventDefault();
+      toggleBulkSelection(bulkCard.dataset.bulkId);
+      return;
+    }
+  }
+
   const target = e.target.closest('[data-action]');
   if (!target) return;
   const action = target.dataset.action;
   const id = target.dataset.id;
 
   switch (action) {
+    case 'bulk-enter':
+      setBulkActive(!bulkState.active);
+      break;
     case 'go':
       go(target.dataset.href || '#/home');
       break;
@@ -4409,6 +4882,7 @@ async function boot() {
       history.replaceState(null, '', location.hash.replace(/[?&]import=1/, ''));
     }, 300);
   }
+  bindLongPress();
   window.addEventListener('hashchange', render);
   if (!location.hash) location.replace('#/home');
   render();
