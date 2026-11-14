@@ -223,7 +223,7 @@ function icons() {
 
 /* ------------------------------- IndexedDB ------------------------------ */
 const DB_NAME = 'playora';
-const DB_VER = 3;
+const DB_VER = 4;
 let db = null;
 
 function openDB() {
@@ -238,6 +238,7 @@ function openDB() {
       if (!d.objectStoreNames.contains('favorites'))  d.createObjectStore('favorites', { keyPath: 'videoId' });
       if (!d.objectStoreNames.contains('thumbnails')) d.createObjectStore('thumbnails', { keyPath: 'videoId' });
       if (!d.objectStoreNames.contains('trash'))       d.createObjectStore('trash', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('folders'))     d.createObjectStore('folders', { keyPath: 'id' });
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
     req.onerror = () => reject(req.error);
@@ -273,8 +274,8 @@ const DEFAULT_SETTINGS = {
 };
 
 const state = {
-  videos: [], playlists: [], history: [], favorites: [], trash: [],
-  videoMap: new Map(), histMap: new Map(), favMap: new Map(), thumbs: new Map(), trashMap: new Map(),
+  videos: [], playlists: [], history: [], favorites: [], trash: [], folders: [],
+  videoMap: new Map(), histMap: new Map(), favMap: new Map(), thumbs: new Map(), trashMap: new Map(), folderMap: new Map(),
   settings: { ...DEFAULT_SETTINGS }
 };
 
@@ -500,8 +501,8 @@ function openThemeModal() {
 
 /* --------------------------------- data --------------------------------- */
 async function loadAll() {
-  const [videos, playlists, history, favorites, thumbs, trash] = await Promise.all([
-    dbAll('videos'), dbAll('playlists'), dbAll('history'), dbAll('favorites'), dbAll('thumbnails'), dbAll('trash')
+  const [videos, playlists, history, favorites, thumbs, trash, folders] = await Promise.all([
+    dbAll('videos'), dbAll('playlists'), dbAll('history'), dbAll('favorites'), dbAll('thumbnails'), dbAll('trash'), dbAll('folders')
   ]);
   state.videos = videos.sort((a, b) => b.addedAt - a.addedAt);
   state.playlists = playlists.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
@@ -509,6 +510,7 @@ async function loadAll() {
   state.favorites = favorites;
   state.thumbs = new Map(thumbs.map(t => [t.videoId, t.dataUrl]));
   state.trash = trash.sort((a, b) => b.deletedAt - a.deletedAt);
+  state.folders = folders.sort((a, b) => (a.addedAt || 0) - (b.addedAt || 0));
   rebuildMaps();
 }
 function rebuildMaps() {
@@ -516,6 +518,7 @@ function rebuildMaps() {
   state.histMap = new Map(state.history.map(h => [h.videoId, h]));
   state.favMap = new Map(state.favorites.map(f => [f.videoId, f]));
   state.trashMap = new Map(state.trash.map(t => [t.id, t]));
+  state.folderMap = new Map(state.folders.map(f => [f.id, f]));
 }
 
 /* --------------------------------- toast -------------------------------- */
@@ -768,7 +771,7 @@ function ensureStoragePersisted() {
   } catch (_) {}
 }
 
-async function importFileRecord(file, handle = null) {
+async function importFileRecord(file, handle = null, extra = {}) {
   const id = uid('v_');
   const url = URL.createObjectURL(file);
   const meta = await probeVideo(url);
@@ -787,7 +790,8 @@ async function importFileRecord(file, handle = null) {
     addedAt: Date.now(),
     lastPlayedAt: 0,
     storage: handle ? 'handle' : 'blob',
-    handle: handle || null
+    handle: handle || null,
+    ...extra
   };
 
   if (!handle) {
@@ -978,6 +982,362 @@ async function resolveVideoSource(rec) {
   return null;
 }
 
+/* ---------------------- folder watching (FS Access) --------------------- */
+function folderWatchSupport() {
+  const hasApi = typeof window.showDirectoryPicker === 'function';
+  const secure = window.isSecureContext === true;
+  const ua     = navigator.userAgent || '';
+
+  if (hasApi && secure) return { ok: true };
+
+  if (!secure) {
+    const where = `${location.protocol}//${location.host || '(no host)'}`;
+    return {
+      ok: false,
+      reason: 'insecure',
+      message: `Folder watching needs https:// or localhost. You're on ${where}. See "why" below.`
+    };
+  }
+
+  const isSafari  = /Safari/i.test(ua) && !/Chrome|Chromium|Edg|OPR|Brave/i.test(ua);
+  const isFirefox = /Firefox/i.test(ua);
+  const isChromey = /Chrome|Chromium|Edg|OPR|Brave/i.test(ua) && !isFirefox;
+
+  if (isSafari) {
+    return {
+      ok: false,
+      reason: 'safari',
+      message: 'Safari does not support folder watching. Open this in Chrome, Edge or Brave (desktop) — or use “Import” for individual files.'
+    };
+  }
+  if (isFirefox) {
+    return {
+      ok: false,
+      reason: 'firefox',
+      message: 'Firefox does not support folder watching. Try Chrome, Edge or Brave for the folder-sync workflow.'
+    };
+  }
+  if (!isChromey) {
+    return {
+      ok: false,
+      reason: 'browser',
+      message: 'This browser does not support folder watching. Use Chrome / Edge / Brave ≥ 86.'
+    };
+  }
+  return {
+    ok: false,
+    reason: 'unknown',
+    message: 'Folder watching is blocked in this tab. If you are in Chrome/Edge, try updating the browser, or open Playora in a normal (non-embedded) tab.'
+  };
+}
+
+const supportsFolderWatch = () => folderWatchSupport().ok;
+
+async function ensureHandlePermission(handle, mode = 'read') {
+  if (!handle) return false;
+  try {
+    if (typeof handle.queryPermission === 'function') {
+      let p = await handle.queryPermission({ mode });
+      if (p === 'granted') return true;
+      if (typeof handle.requestPermission === 'function') {
+        p = await handle.requestPermission({ mode });
+      }
+      return p === 'granted';
+    }
+    return true;
+  } catch (_) { return false; }
+}
+
+async function walkDirectory(dirHandle, basePath = '') {
+  const out = [];
+  for await (const [name, handle] of dirHandle.entries()) {
+    const path = basePath ? basePath + '/' + name : name;
+    if (handle.kind === 'file') {
+      out.push({ path, name, handle });
+    } else if (handle.kind === 'directory') {
+      const sub = await walkDirectory(handle, path);
+      out.push(...sub);
+    }
+  }
+  return out;
+}
+
+async function pickAndAddFolder() {
+  const support = folderWatchSupport();
+  if (!support.ok) {
+    showFolderWatchHelp(support);
+    return;
+  }
+  try {
+    const handle = await window.showDirectoryPicker({ mode: 'read' });
+    if (!handle) return;
+    const ok = await ensureHandlePermission(handle, 'read');
+    if (!ok) { toast('Folder permission was not granted', 'error'); return; }
+
+    /* Reuse existing entry if the same physical folder is re-picked */
+    let existing = null;
+    for (const f of state.folders) {
+      try {
+        if (typeof handle.isSameEntry === 'function' && f.handle) {
+          if (await handle.isSameEntry(f.handle)) { existing = f; break; }
+        } else if (f.name === handle.name) {
+          existing = f;
+        }
+      } catch (_) {
+        if (f.name === handle.name) existing = f;
+      }
+    }
+    if (existing) {
+      existing.handle = handle;
+      existing.lastSyncedAt = 0;
+      await dbPut('folders', existing);
+      toast(`Re-linked "${handle.name}" — scanning…`);
+      await syncFolder(existing.id);
+      return;
+    }
+
+    const rec = {
+      id: uid('f_'),
+      name: handle.name,
+      handle,
+      addedAt: Date.now(),
+      lastSyncedAt: 0
+    };
+    await dbPut('folders', rec);
+    state.folders.push(rec);
+    state.folderMap.set(rec.id, rec);
+
+    toast(`Watching "${handle.name}" — scanning…`, 'success');
+    await syncFolder(rec.id);
+    render();
+  } catch (err) {
+    if (err && err.name === 'AbortError') return;
+    console.warn('Folder pick failed', err);
+    toast('Could not add that folder', 'error');
+  }
+}
+
+function showFolderWatchHelp(support) {
+  const fixes = {
+    insecure: [
+      'Open Playora over <b>https://</b>, or via <b>http://localhost</b> on the same machine.',
+      'On a phone? Serve over HTTPS — e.g. <code>ngrok http 8080</code>, <code>npx serve --ssl</code>, or a hosted URL.',
+      'You can still click the <b>+ Import</b> button to add individual video files.'
+    ],
+    safari: [
+      'Folder watching needs the File System Access API, which Safari does not ship.',
+      'On iPhone / iPad, every browser (Chrome included) is Safari under the hood — so folder watch is unavailable on iOS.',
+      'Use <b>+ Import</b> on mobile, or open Playora in Chrome / Edge on desktop for folder sync.'
+    ],
+    firefox: [
+      'Firefox has not shipped the File System Access API.',
+      'Use <b>Chrome</b>, <b>Edge</b> or <b>Brave</b> for folder watching.',
+      'Or keep using <b>+ Import</b> to add individual videos.'
+    ],
+    browser: [
+      'Your browser does not implement the File System Access API.',
+      'Use <b>Chrome</b>, <b>Edge</b> or <b>Brave</b> (version 86 or newer).'
+    ],
+    unknown: [
+      'If you are in Chrome or Edge: try updating the browser to the latest version.',
+      'If Playora is embedded in another page, open it directly (top-level tab).',
+      'If your device is managed by an organisation, the feature may be blocked by policy.'
+    ]
+  }[support.reason] || [];
+
+  openModal({
+    title: 'Folder watching unavailable',
+    body: `
+      <p class="text-[13px] leading-relaxed text-white/75">${esc(support.message)}</p>
+      ${fixes.length ? `
+        <div class="mt-3 rounded-xl border border-line/70 bg-surface/50 p-3">
+          <p class="text-[10.5px] uppercase tracking-wider text-muted font-semibold mb-2">What to do</p>
+          <ul class="space-y-1.5 text-[12px] leading-relaxed text-white/70">
+            ${fixes.map(f => `<li class="flex gap-2"><span class="text-accent mt-0.5">•</span><span>${f}</span></li>`).join('')}
+          </ul>
+        </div>` : ''}
+      <p class="mt-3 text-[11.5px] text-muted">
+        You can always add videos with the
+        <span class="text-white/80 font-medium">+ Import</span> button — that path works everywhere.
+      </p>`,
+    footer: `<button data-ok class="w-full h-11 rounded-xl bg-accent hover:bg-accent2 active:scale-[0.99] transition text-[13.5px] font-semibold text-white">Got it</button>`,
+    onMount(root, done) {
+      root.querySelector('[data-ok]').addEventListener('click', () => done(true));
+    }
+  });
+}
+
+async function syncFolder(folderId, opts = {}) {
+  const rec = state.folderMap.get(folderId);
+  if (!rec) { toast('Folder not found', 'error'); return null; }
+
+  const ok = await ensureHandlePermission(rec.handle, 'read');
+  if (!ok) {
+    toast(`Permission to "${rec.name}" was denied — re-add the folder to grant access`, 'error', 5000);
+    return null;
+  }
+
+  if (!opts.silent) importBar();
+
+  /* 1. Walk every entry in the folder tree */
+  let entries = [];
+  try {
+    entries = await walkDirectory(rec.handle, '');
+  } catch (err) {
+    console.warn('Folder walk failed', err);
+    hideImportBar();
+    toast('Could not read folder contents', 'error');
+    return null;
+  }
+
+  /* 2. Keep only video files (reads the actual File blob for each) */
+  const videoEntries = [];
+  for (const e of entries) {
+    try {
+      const file = await e.handle.getFile();
+      if (isVideoFile(file)) videoEntries.push({ ...e, file });
+    } catch (_) {}
+  }
+
+  /* 3. Index videos already linked to this folder by relative path */
+  const existing = new Map();
+  for (const v of state.videos) {
+    if (v.folderId === folderId) {
+      existing.set(v.relativePath || v.originalName, v);
+    }
+  }
+
+  const seenPaths = new Set();
+  let added = 0, restored = 0, missingMarked = 0, updated = 0;
+
+  for (let i = 0; i < videoEntries.length; i++) {
+    const { path, name, file, handle } = videoEntries[i];
+    seenPaths.add(path);
+    const prev = existing.get(path);
+
+    if (prev) {
+      let dirty = false;
+      if (prev.missing)         { prev.missing = false; dirty = true; restored++; }
+      if (prev.handle !== handle) { prev.handle = handle; dirty = true; }
+      if ((file.size || 0) && prev.size !== file.size) { prev.size = file.size; dirty = true; }
+      if (prev.storage !== 'handle') { prev.storage = 'handle'; dirty = true; }
+      if (dirty) { await dbPut('videos', prev); updated++; }
+      continue;
+    }
+
+    if (!opts.silent) updateImportBar(i, videoEntries.length, 'Importing ' + name);
+    try {
+      await importFileRecord(file, handle, { folderId, relativePath: path, missing: false });
+      added++;
+    } catch (err) {
+      console.warn('Folder import failed', file.name, err);
+    }
+    if (!opts.silent) updateImportBar(i + 1, videoEntries.length);
+  }
+
+  /* 4. Anything we used to know about but no longer see → mark missing */
+  for (const [path, v] of existing.entries()) {
+    if (!seenPaths.has(path) && !v.missing) {
+      v.missing = true;
+      await dbPut('videos', v);
+      missingMarked++;
+    }
+  }
+
+  rec.lastSyncedAt = Date.now();
+  await dbPut('folders', rec);
+
+  if (!opts.silent) hideImportBar();
+  await loadAll();
+
+  if (added || restored || missingMarked || updated) {
+    const parts = [];
+    if (added)         parts.push(`${added} new`);
+    if (restored)      parts.push(`${restored} restored`);
+    if (missingMarked) parts.push(`${missingMarked} missing`);
+    if (updated && !added && !restored && !missingMarked) parts.push(`${updated} updated`);
+    toast(`"${rec.name}": ${parts.join(', ')}`, (added || restored) ? 'success' : 'default', 4000);
+  } else if (!opts.silent) {
+    toast(`"${rec.name}" is already up to date`);
+  }
+
+  if (!opts.silent) refreshRoute();
+  return { added, restored, missingMarked, updated };
+}
+
+async function syncAllFolders() {
+  if (!state.folders.length) { toast('No watched folders yet'); return; }
+  let added = 0, restored = 0, missing = 0;
+  for (const f of state.folders) {
+    const res = await syncFolder(f.id, { silent: true });
+    if (res) { added += res.added; restored += res.restored; missing += res.missingMarked; }
+  }
+  if (added || restored || missing) {
+    const parts = [];
+    if (added)    parts.push(`${added} new`);
+    if (restored) parts.push(`${restored} restored`);
+    if (missing)  parts.push(`${missing} missing`);
+    toast(`All folders synced: ${parts.join(', ')}`, (added || restored) ? 'success' : 'default', 4000);
+  } else {
+    toast('All folders up to date');
+  }
+  refreshRoute();
+}
+
+async function removeWatchedFolder(folderId, alsoVideos = false) {
+  const rec = state.folderMap.get(folderId);
+  if (!rec) return;
+  const linked = state.videos.filter(v => v.folderId === folderId);
+
+  const ok = await confirmDialog({
+    title: alsoVideos ? 'Remove folder and its videos?' : 'Stop watching this folder?',
+    message: alsoVideos
+      ? `"${rec.name}" will be removed and ${linked.length} linked video${linked.length === 1 ? '' : 's'} will move to Recently deleted.`
+      : `"${rec.name}" will be removed from the watch list. ${linked.length} video${linked.length === 1 ? '' : 's'} stay in your library as standalone videos.`,
+    confirmText: alsoVideos ? 'Remove everything' : 'Unlink folder',
+    danger: true
+  });
+  if (!ok) return;
+
+  if (alsoVideos) {
+    for (const v of linked) await moveToTrash(v.id);
+  } else {
+    for (const v of linked) {
+      delete v.folderId;
+      delete v.relativePath;
+      delete v.missing;
+      await dbPut('videos', v);
+    }
+  }
+
+  await dbDel('folders', folderId).catch(() => {});
+  state.folders = state.folders.filter(f => f.id !== folderId);
+  state.folderMap.delete(folderId);
+  await loadAll();
+  toast('Folder removed from watch list');
+  render();
+}
+
+async function tryAutoSyncFolders() {
+  if (!state.folders.length || !supportsFolderWatch()) return;
+  let changed = false;
+  for (const f of state.folders) {
+    try {
+      const p = typeof f.handle.queryPermission === 'function'
+        ? await f.handle.queryPermission({ mode: 'read' })
+        : 'granted';
+      if (p === 'granted') {
+        const res = await syncFolder(f.id, { silent: true });
+        if (res && (res.added || res.restored || res.missingMarked)) changed = true;
+      }
+    } catch (_) {}
+  }
+  if (changed) {
+    const { parts } = parseHash();
+    if ((parts[0] || 'home') !== 'player') render();
+  }
+}
+
 /* --------------------------- shared UI pieces --------------------------- */
 const iconBtn = (icon, attrs = '', cls = '', size = 'w-[19px] h-[19px]') =>
   `<button ${attrs} class="w-10 h-10 grid place-items-center rounded-full text-white/65 hover:text-white hover:bg-white/[0.07] active:scale-95 transition ${cls}">
@@ -1006,6 +1366,7 @@ function videoCardGrid(v) {
   const pct = progressOf(v);
   const isFav = state.favMap.has(v.id);
   const isDone = !!(h && h.completed);
+  const isMissing = !!v.missing;
   const bulk = bulkState.active;
   const selected = bulk && bulkState.selected.has(v.id);
 
@@ -1042,7 +1403,11 @@ function videoCardGrid(v) {
         <div class="min-w-0 flex-1 ${bulk ? '' : 'cursor-pointer'}"
              ${bulk ? '' : `data-action="play" data-id="${v.id}"`}>
           <p class="text-[13px] font-medium leading-snug line-clamp-2 text-white/92">${esc(v.name)}</p>
-          <p class="mt-1 text-[11px] text-muted truncate">${esc(relDate(v.addedAt))}${v.size ? ' · ' + fmtSize(v.size) : ''}</p>
+          <p class="mt-1 text-[11px] ${isMissing ? 'text-amber-400 font-medium' : 'text-muted'} truncate">
+            ${isMissing
+              ? '<i data-lucide="alert-triangle" class="inline w-3 h-3 -mt-0.5 mr-0.5"></i>Missing from folder'
+              : `${esc(relDate(v.addedAt))}${v.size ? ' · ' + fmtSize(v.size) : ''}`}
+          </p>
         </div>
         ${bulk ? '' : `<button data-action="vmenu" data-id="${v.id}"
           class="w-8 h-8 -mr-1 shrink-0 grid place-items-center rounded-full text-white/45 hover:text-white hover:bg-white/[0.07] transition">
@@ -1056,6 +1421,7 @@ function videoRow(v) {
   const pct = progressOf(v);
   const bulk = bulkState.active;
   const selected = bulk && bulkState.selected.has(v.id);
+  const isMissing = !!v.missing;
 
   return `
     <div class="group flex items-center gap-3 p-2 rounded-xl transition
@@ -1076,8 +1442,10 @@ function videoRow(v) {
       <div class="min-w-0 flex-1 ${bulk ? '' : 'cursor-pointer'}"
            ${bulk ? '' : `data-action="play" data-id="${v.id}"`}>
         <p class="text-[13px] font-medium leading-snug truncate">${esc(v.name)}</p>
-        <p class="mt-1 text-[11px] text-muted truncate">
-          ${fmtTime(v.duration)}${v.size ? ' · ' + fmtSize(v.size) : ''} · ${esc(relDate(v.addedAt))}
+        <p class="mt-1 text-[11px] ${isMissing ? 'text-amber-400 font-medium' : 'text-muted'} truncate">
+          ${isMissing
+            ? '<i data-lucide="alert-triangle" class="inline w-3 h-3 -mt-0.5 mr-0.5"></i>Missing from folder'
+            : `${fmtTime(v.duration)}${v.size ? ' · ' + fmtSize(v.size) : ''} · ${esc(relDate(v.addedAt))}`}
         </p>
         ${pct > 0.5 ? `<p class="mt-1 text-[10.5px] text-accent/90">${Math.round(pct)}% watched</p>` : ''}
       </div>
@@ -1491,6 +1859,7 @@ function viewLibrary() {
           <p id="lib-subtitle" class="text-[10.5px] text-muted leading-none mt-1">${esc(libSubtitleText())}</p>
         </div>
         ${bulkSelectBtnHTML()}
+        ${iconBtn('folder-plus', 'data-action="add-folder" title="Add watched folder"')}
         <button data-action="layout" data-layout="${libState.layout === 'grid' ? 'list' : 'grid'}"
           class="w-10 h-10 grid place-items-center rounded-full text-white/65 hover:text-white hover:bg-white/[0.07] transition"
           title="${libState.layout === 'grid' ? 'List view' : 'Grid view'}">
@@ -4170,6 +4539,72 @@ function toggleControl(key, on) {
   return `<button data-action="setting-toggle" data-key="${key}" class="sw ${on ? 'on' : ''}" aria-pressed="${on}"><span></span></button>`;
 }
 
+function folderManagerHTML() {
+  const folders = state.folders;
+
+  if (!folders.length) {
+    return `
+      <div class="px-4 pb-4">
+        <div class="flex items-start gap-3 p-3 rounded-xl border border-dashed border-line/80 bg-surface/40">
+          <div class="w-9 h-9 rounded-lg bg-accent/10 border border-accent/20 grid place-items-center shrink-0">
+            <i data-lucide="folder-plus" class="w-4 h-4 text-accent"></i>
+          </div>
+          <div class="min-w-0 flex-1">
+            <p class="text-[12.5px] font-medium">No watched folders</p>
+            <p class="text-[11px] text-muted mt-0.5 leading-snug">Pick a folder once and Playora keeps it in sync — new videos appear automatically, removed files get flagged.</p>
+          </div>
+        </div>
+        <button data-action="add-folder"
+          class="mt-2.5 w-full h-10 rounded-xl bg-accent hover:bg-accent2 active:scale-[0.99] transition text-[12.5px] font-semibold text-white flex items-center justify-center gap-1.5">
+          <i data-lucide="folder-plus" class="w-4 h-4"></i> Add watched folder
+        </button>
+        <p class="mt-2 text-[10.5px] text-muted/70 text-center">Needs Chrome / Edge / Chromium on a secure origin (https or localhost)</p>
+      </div>`;
+  }
+
+  const rows = folders.map(f => {
+    const videos = state.videos.filter(v => v.folderId === f.id);
+    const missing = videos.filter(v => v.missing).length;
+    const lastSync = f.lastSyncedAt ? 'synced ' + relTime(f.lastSyncedAt) : 'not synced yet';
+    return `
+      <div class="flex items-center gap-2.5 py-2.5">
+        <div class="w-8 h-8 rounded-lg bg-white/[0.04] border border-line/60 grid place-items-center shrink-0">
+          <i data-lucide="folder" class="w-4 h-4 text-white/45"></i>
+        </div>
+        <div class="min-w-0 flex-1">
+          <p class="text-[13px] font-medium truncate">${esc(f.name)}</p>
+          <p class="text-[11px] text-muted mt-0.5 truncate">
+            ${videos.length} video${videos.length === 1 ? '' : 's'}
+            ${missing ? ` · <span class="text-amber-400 font-medium">${missing} missing</span>` : ''}
+            · ${esc(lastSync)}
+          </p>
+        </div>
+        <button data-action="sync-folder" data-id="${f.id}"
+          class="h-8 px-2.5 rounded-lg border border-line text-[11.5px] font-medium text-white/75 hover:bg-white/[0.05] transition flex items-center gap-1 shrink-0">
+          <i data-lucide="refresh-cw" class="w-3 h-3"></i> Sync
+        </button>
+        <button data-action="folder-menu" data-id="${f.id}"
+          class="w-8 h-8 grid place-items-center rounded-lg text-white/45 hover:text-white hover:bg-white/[0.06] transition shrink-0">
+          <i data-lucide="more-vertical" class="w-4 h-4"></i>
+        </button>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="px-4 pb-1 divide-y divide-line/40">${rows}</div>
+    <div class="px-4 pb-4 pt-2 flex items-center gap-2">
+      <button data-action="add-folder"
+        class="flex-1 h-9 rounded-lg border border-dashed border-line text-[12px] font-medium text-white/70 hover:bg-white/[0.04] transition flex items-center justify-center gap-1.5">
+        <i data-lucide="folder-plus" class="w-3.5 h-3.5"></i> Add folder
+      </button>
+      <button data-action="sync-all-folders"
+        class="flex-1 h-9 rounded-lg bg-accent/12 border border-accent/25 text-[12px] font-medium text-accent hover:bg-accent/20 transition flex items-center justify-center gap-1.5">
+        <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i> Sync all
+      </button>
+    </div>`;
+}
+
+
 function viewSettings() {
   const s = state.settings;
   const speeds = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
@@ -4279,6 +4714,17 @@ function viewSettings() {
             </span>
           </button>
         </div>
+      </section>
+
+      <!-- ---------- WATCHED FOLDERS ---------- -->
+      <section class="rounded-2xl border border-line bg-panel">
+        <div class="flex items-center gap-2 px-4 pt-4 pb-1">
+          <div class="w-6 h-6 rounded-md bg-accent/15 grid place-items-center">
+            <i data-lucide="folder-open" class="w-3.5 h-3.5 text-accent"></i>
+          </div>
+          <h2 class="text-[11px] uppercase tracking-wider text-white/80 font-semibold">Watched folders</h2>
+        </div>
+        ${folderManagerHTML()}
       </section>
 
       <!-- ---------- APPLICATION ---------- -->
@@ -4430,6 +4876,14 @@ function go(hash) {
 }
 
 function playVideo(id, listId) {
+  const rec = state.videoMap.get(id);
+  if (rec && rec.missing) {
+    const folder = rec.folderId ? state.folderMap.get(rec.folderId) : null;
+    toast(folder
+      ? `"${rec.name}" is missing — re-sync "${folder.name}" to refresh`
+      : 'This video is missing from disk', 'error', 4000);
+    return;
+  }
   Player.returnTo = location.hash || '#/home';
   go('#/player/' + id + (listId ? '?list=' + listId : ''));
 }
@@ -4598,6 +5052,31 @@ document.addEventListener('click', async (e) => {
     case 'import':
       pickAndImport();
       break;
+
+    case 'add-folder':
+      pickAndAddFolder();
+      break;
+
+    case 'sync-folder':
+      syncFolder(id);
+      break;
+
+    case 'sync-all-folders':
+      syncAllFolders();
+      break;
+
+    case 'folder-menu': {
+      const rec = state.folderMap.get(id);
+      if (!rec) break;
+      const rect = target.getBoundingClientRect();
+      showMenu(rect.right - 218, rect.bottom + 6, [
+        { label: 'Sync now',                  icon: 'refresh-cw', onClick: () => syncFolder(id) },
+        '-',
+        { label: 'Unlink folder (keep videos)', icon: 'unlink',    onClick: () => removeWatchedFolder(id, false) },
+        { label: 'Remove folder + videos',    icon: 'trash-2', danger: true, onClick: () => removeWatchedFolder(id, true) }
+      ]);
+      break;
+    }
 
     case 'play': {
       const listId = target.dataset.list || null;
@@ -5443,6 +5922,9 @@ async function boot() {
   applyTheme(state.settings.theme);
   await loadAll();
   const purged = purgeExpiredTrash();
+
+  /* silently re-scan watched folders when permission is still granted */
+  tryAutoSyncFolders();
   if (purged > 0) console.log(`[Playora] Auto-purged ${purged} expired trash item(s)`);
   PWA.init();
 
