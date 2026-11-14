@@ -223,7 +223,7 @@ function icons() {
 
 /* ------------------------------- IndexedDB ------------------------------ */
 const DB_NAME = 'playora';
-const DB_VER = 1;
+const DB_VER = 3;
 let db = null;
 
 function openDB() {
@@ -237,6 +237,7 @@ function openDB() {
       if (!d.objectStoreNames.contains('history'))    d.createObjectStore('history', { keyPath: 'videoId' });
       if (!d.objectStoreNames.contains('favorites'))  d.createObjectStore('favorites', { keyPath: 'videoId' });
       if (!d.objectStoreNames.contains('thumbnails')) d.createObjectStore('thumbnails', { keyPath: 'videoId' });
+      if (!d.objectStoreNames.contains('trash'))       d.createObjectStore('trash', { keyPath: 'id' });
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
     req.onerror = () => reject(req.error);
@@ -272,14 +273,32 @@ const DEFAULT_SETTINGS = {
 };
 
 const state = {
-  videos: [], playlists: [], history: [], favorites: [],
-  videoMap: new Map(), histMap: new Map(), favMap: new Map(), thumbs: new Map(),
+  videos: [], playlists: [], history: [], favorites: [], trash: [],
+  videoMap: new Map(), histMap: new Map(), favMap: new Map(), thumbs: new Map(), trashMap: new Map(),
   settings: { ...DEFAULT_SETTINGS }
 };
 
+/* ---------- trash retention ---------- */
+const TRASH_RETENTION_DAYS = 30;
+const TRASH_RETENTION_MS   = TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
+function daysLeftInTrash(deletedAt) {
+  const elapsed = Date.now() - deletedAt;
+  return Math.max(0, (TRASH_RETENTION_MS - elapsed) / (24 * 60 * 60 * 1000));
+}
+
+function trashDeletedText(deletedAt) {
+  const s = Math.floor((Date.now() - deletedAt) / 1000);
+  if (s < 60)    return 'Just now';
+  if (s < 3600)  return Math.floor(s / 60) + ' min ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  const d = Math.floor(s / 86400);
+  return d === 1 ? 'Yesterday' : d + ' days ago';
+}
+
 const libState = { search: '', sort: 'added-desc', layout: 'grid', filter: 'all' };
 const favState = { search: '' };
-const bulkState = { active: false, selected: new Set() };
+const bulkState = { active: false, scope: 'library', selected: new Set() };
 const longPressState = { timer: null, fired: false, startX: 0, startY: 0 };
 
 function loadSettings() {
@@ -481,20 +500,22 @@ function openThemeModal() {
 
 /* --------------------------------- data --------------------------------- */
 async function loadAll() {
-  const [videos, playlists, history, favorites, thumbs] = await Promise.all([
-    dbAll('videos'), dbAll('playlists'), dbAll('history'), dbAll('favorites'), dbAll('thumbnails')
+  const [videos, playlists, history, favorites, thumbs, trash] = await Promise.all([
+    dbAll('videos'), dbAll('playlists'), dbAll('history'), dbAll('favorites'), dbAll('thumbnails'), dbAll('trash')
   ]);
   state.videos = videos.sort((a, b) => b.addedAt - a.addedAt);
   state.playlists = playlists.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   state.history = history;
   state.favorites = favorites;
   state.thumbs = new Map(thumbs.map(t => [t.videoId, t.dataUrl]));
+  state.trash = trash.sort((a, b) => b.deletedAt - a.deletedAt);
   rebuildMaps();
 }
 function rebuildMaps() {
   state.videoMap = new Map(state.videos.map(v => [v.id, v]));
   state.histMap = new Map(state.history.map(h => [h.videoId, h]));
   state.favMap = new Map(state.favorites.map(f => [f.videoId, f]));
+  state.trashMap = new Map(state.trash.map(t => [t.id, t]));
 }
 
 /* --------------------------------- toast -------------------------------- */
@@ -1421,6 +1442,45 @@ function filteredVideos(search, sort, filter = 'all') {
   return sortedVideos(base, sort);
 }
 
+/* every ID that "Select all" should toggle for the current bulk scope */
+function bulkSelectableIds() {
+  const scope = bulkState.scope;
+  if (scope === 'library') {
+    return filteredVideos(libState.search, libState.sort, libState.filter).map(v => v.id);
+  }
+  if (scope === 'favorites') {
+    const q = favState.search.trim().toLowerCase();
+    return state.favorites
+      .slice().sort((a, b) => b.addedAt - a.addedAt)
+      .map(f => state.videoMap.get(f.videoId)).filter(Boolean)
+      .filter(v => !q || v.name.toLowerCase().includes(q))
+      .map(v => v.id);
+  }
+  if (scope === 'history') {
+    return state.history
+      .slice().sort((a, b) => b.lastWatchedAt - a.lastWatchedAt)
+      .filter(h => state.videoMap.has(h.videoId))
+      .map(h => h.videoId);
+  }
+  if (scope === 'trash') {
+    return state.trash.map(t => t.id);
+  }
+  return [];
+}
+
+/* the header "Select / Cancel" pill, rendered with live state */
+function bulkSelectBtnHTML() {
+  const active = bulkState.active;
+  return `<button data-action="bulk-enter"
+    class="h-10 px-3 rounded-full text-[12px] font-medium transition flex items-center gap-1.5 ${
+      active ? 'bg-accent text-white' : 'text-white/65 hover:text-white hover:bg-white/[0.07]'
+    }"
+    title="${active ? 'Exit selection' : 'Select multiple'}">
+    <i data-lucide="${active ? 'x' : 'check-square'}" class="w-[16px] h-[16px]"></i>
+    <span class="hidden sm:inline">${active ? 'Cancel' : 'Select'}</span>
+  </button>`;
+}
+
 function viewLibrary() {
   const sortOpt = LIB_SORTS.find(s => s.key === libState.sort) || LIB_SORTS[0];
   const header = `
@@ -1430,12 +1490,7 @@ function viewLibrary() {
           <h1 class="text-[17px] md:text-[19px] font-semibold tracking-tight leading-none">Library</h1>
           <p id="lib-subtitle" class="text-[10.5px] text-muted leading-none mt-1">${esc(libSubtitleText())}</p>
         </div>
-        <button data-action="bulk-enter"
-          class="h-10 px-3 rounded-full text-[12px] font-medium transition flex items-center gap-1.5 text-white/65 hover:text-white hover:bg-white/[0.07]"
-          title="Select multiple">
-          <i data-lucide="check-square" class="w-[16px] h-[16px]"></i>
-          <span class="hidden sm:inline">Select</span>
-        </button>
+        ${bulkSelectBtnHTML()}
         <button data-action="layout" data-layout="${libState.layout === 'grid' ? 'list' : 'grid'}"
           class="w-10 h-10 grid place-items-center rounded-full text-white/65 hover:text-white hover:bg-white/[0.07] transition"
           title="${libState.layout === 'grid' ? 'List view' : 'Grid view'}">
@@ -1491,8 +1546,9 @@ function bindLongPress() {
     /* inside bulk mode, plain taps toggle — no long-press needed */
     if (bulkState.active) return;
 
-    /* long-press only applies to library view, where bulk mode lives */
-    if (!location.hash.startsWith('#/library')) return;
+    /* long-press works on library / favorites / history / trash */
+    const _bv = ((location.hash || '').replace(/^#\//, '').split('?')[0].split('/')[0] || '');
+    if (!['library', 'favorites', 'history', 'trash'].includes(_bv)) return;
 
     /* must be on a card, but not on its ⋮ / play / text buttons */
     const card = e.target.closest && e.target.closest('[data-bulk-id]');
@@ -1561,41 +1617,116 @@ function bindLongPress() {
   });
 }
 
-function setBulkActive(active) {
+function setBulkActive(active, scopeOverride) {
   bulkState.active = active;
-  if (!active) bulkState.selected.clear();
+  if (!active) {
+    bulkState.selected.clear();
+  } else {
+    const v = ((location.hash || '').replace(/^#\//, '').split('?')[0].split('/')[0] || '');
+    bulkState.scope = scopeOverride || (['library','favorites','history','trash'].includes(v) ? v : 'library');
+  }
   document.body.classList.toggle('bulk-active', active);
 
-  /* update the "Select" button in the header */
-  const selectBtn = document.querySelector('[data-action="bulk-enter"]');
-  if (selectBtn) {
-    selectBtn.className = `h-10 px-3 rounded-full text-[12px] font-medium transition flex items-center gap-1.5 ${
+  /* update *every* Select/Cancel pill currently in the DOM */
+  document.querySelectorAll('[data-action="bulk-enter"]').forEach(btn => {
+    btn.className = `h-10 px-3 rounded-full text-[12px] font-medium transition flex items-center gap-1.5 ${
       active ? 'bg-accent text-white' : 'text-white/65 hover:text-white hover:bg-white/[0.07]'
     }`;
-    selectBtn.title = active ? 'Exit selection' : 'Select multiple';
-    selectBtn.innerHTML = `
+    btn.title = active ? 'Exit selection' : 'Select multiple';
+    btn.innerHTML = `
       <i data-lucide="${active ? 'x' : 'check-square'}" class="w-[16px] h-[16px]"></i>
       <span class="hidden sm:inline">${active ? 'Cancel' : 'Select'}</span>`;
-  }
+  });
 
   const bar = $('#bulk-bar');
   if (bar) bar.classList.toggle('hidden', !active);
   const bottomNav = $('#bottom-nav');
   if (bottomNav) bottomNav.classList.toggle('hidden', active);
 
-  if ($('#lib-body')) {
-    renderLibraryBody();
-    if (active) updateBulkBar();
-  }
+  rerenderCurrentBulkView();
+  if (active) updateBulkBar();
   icons();
+}
+
+/* re-render the page that owns the current bulk scope, preserving scroll */
+function rerenderCurrentBulkView() {
+  const v = ((location.hash || '').replace(/^#\//, '').split('?')[0].split('/')[0] || '');
+  if (v === 'library') { renderLibraryBody(); return; }
+  const y = window.scrollY;
+  const viewEl = $('#view');
+  if (v === 'favorites') viewEl.innerHTML = viewFavorites();
+  else if (v === 'history') viewEl.innerHTML = viewHistory();
+  else if (v === 'trash') viewEl.innerHTML = viewTrash();
+  else return;
+  icons();
+  bindViewEvents(v);
+  window.scrollTo(0, y);
 }
 
 function updateBulkBar() {
   const bar = $('#bulk-bar');
   if (!bar) return;
   const count = bulkState.selected.size;
-  const list = filteredVideos(libState.search, libState.sort, libState.filter);
-  const allSelected = list.length > 0 && list.every(v => bulkState.selected.has(v.id));
+  const scope = bulkState.scope;
+  const listIds = bulkSelectableIds();
+  const allSelected = listIds.length > 0 && listIds.every(id => bulkState.selected.has(id));
+  const dis = count ? '' : 'disabled';
+
+  const actionBtns = (() => {
+    if (scope === 'library') return `
+      <button data-bulk-action="favorite" ${dis}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-white/85 hover:bg-white/[0.06] transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="heart" class="w-4 h-4"></i><span class="hidden md:inline">Favorite</span>
+      </button>
+      <button data-bulk-action="playlist" ${dis}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-white/85 hover:bg-white/[0.06] transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="list-plus" class="w-4 h-4"></i><span class="hidden md:inline">Playlist</span>
+      </button>
+      <button data-bulk-action="remove" ${dis}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-red-300 hover:bg-red-500/10 transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="trash-2" class="w-4 h-4"></i><span class="hidden md:inline">Delete</span>
+      </button>`;
+
+    if (scope === 'favorites') return `
+      <button data-bulk-action="unfavorite" ${dis}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-white/85 hover:bg-white/[0.06] transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="heart-off" class="w-4 h-4"></i><span class="hidden md:inline">Unfavorite</span>
+      </button>
+      <button data-bulk-action="playlist" ${dis}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-white/85 hover:bg-white/[0.06] transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="list-plus" class="w-4 h-4"></i><span class="hidden md:inline">Playlist</span>
+      </button>
+      <button data-bulk-action="remove" ${dis}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-red-300 hover:bg-red-500/10 transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="trash-2" class="w-4 h-4"></i><span class="hidden md:inline">Delete</span>
+      </button>`;
+
+    if (scope === 'history') return `
+      <button data-bulk-action="favorite" ${dis}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-white/85 hover:bg-white/[0.06] transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="heart" class="w-4 h-4"></i><span class="hidden md:inline">Favorite</span>
+      </button>
+      <button data-bulk-action="playlist" ${dis}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-white/85 hover:bg-white/[0.06] transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="list-plus" class="w-4 h-4"></i><span class="hidden md:inline">Playlist</span>
+      </button>
+      <button data-bulk-action="remove-history" ${dis}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-red-300 hover:bg-red-500/10 transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="history" class="w-4 h-4"></i><span class="hidden md:inline">Remove</span>
+      </button>`;
+
+    if (scope === 'trash') return `
+      <button data-bulk-action="restore" ${dis}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-white/85 hover:bg-white/[0.06] transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="rotate-ccw" class="w-4 h-4"></i><span class="hidden md:inline">Restore</span>
+      </button>
+      <button data-bulk-action="delete-forever" ${dis}
+        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-red-300 hover:bg-red-500/10 transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
+        <i data-lucide="trash-2" class="w-4 h-4"></i><span class="hidden md:inline">Delete forever</span>
+      </button>`;
+
+    return '';
+  })();
 
   bar.innerHTML = `
     <div class="flex items-center gap-2 px-3 md:px-5 h-16">
@@ -1614,21 +1745,7 @@ function updateBulkBar() {
         <span class="hidden sm:inline">${allSelected ? 'Deselect' : 'Select'} all</span>
       </button>
       <div class="h-6 w-px bg-line/80 mx-0.5"></div>
-      <button data-bulk-action="favorite" ${count ? '' : 'disabled'}
-        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-white/85 hover:bg-white/[0.06] transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
-        <i data-lucide="heart" class="w-4 h-4"></i>
-        <span class="hidden md:inline">Favorite</span>
-      </button>
-      <button data-bulk-action="playlist" ${count ? '' : 'disabled'}
-        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-white/85 hover:bg-white/[0.06] transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
-        <i data-lucide="list-plus" class="w-4 h-4"></i>
-        <span class="hidden md:inline">Playlist</span>
-      </button>
-      <button data-bulk-action="remove" ${count ? '' : 'disabled'}
-        class="h-10 px-2.5 md:px-3 rounded-lg text-[12.5px] font-medium text-red-300 hover:bg-red-500/10 transition flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
-        <i data-lucide="trash-2" class="w-4 h-4"></i>
-        <span class="hidden md:inline">Delete</span>
-      </button>
+      ${actionBtns}
     </div>`;
   icons();
 }
@@ -1636,7 +1753,7 @@ function updateBulkBar() {
 function toggleBulkSelection(id) {
   if (bulkState.selected.has(id)) bulkState.selected.delete(id);
   else bulkState.selected.add(id);
-  renderLibraryBody();
+  rerenderCurrentBulkView();
   updateBulkBar();
 }
 
@@ -1700,11 +1817,11 @@ async function handleBulkAction(action) {
   if (action === 'cancel') { setBulkActive(false); return; }
 
   if (action === 'select-all') {
-    const list = filteredVideos(libState.search, libState.sort, libState.filter);
-    const allSelected = list.length > 0 && list.every(v => bulkState.selected.has(v.id));
+    const listIds = bulkSelectableIds();
+    const allSelected = listIds.length > 0 && listIds.every(id => bulkState.selected.has(id));
     if (allSelected) bulkState.selected.clear();
-    else list.forEach(v => bulkState.selected.add(v.id));
-    renderLibraryBody();
+    else listIds.forEach(id => bulkState.selected.add(id));
+    rerenderCurrentBulkView();
     updateBulkBar();
     return;
   }
@@ -1712,6 +1829,7 @@ async function handleBulkAction(action) {
   const ids = Array.from(bulkState.selected);
   if (!ids.length) return;
 
+  /* ---- Favorite (from Library / History) ---- */
   if (action === 'favorite') {
     let added = 0;
     for (const id of ids) {
@@ -1726,39 +1844,88 @@ async function handleBulkAction(action) {
     toast(`Added ${added} to favorites`, 'success');
     setBulkActive(false);
     render();
-  } else if (action === 'playlist') {
+    return;
+  }
+
+  /* ---- Unfavorite (from Favorites) ---- */
+  if (action === 'unfavorite') {
+    let removed = 0;
+    for (const id of ids) {
+      if (state.favMap.has(id)) {
+        await dbDel('favorites', id).catch(() => {});
+        removed++;
+      }
+    }
+    state.favorites = state.favorites.filter(f => !ids.includes(f.videoId));
+    ids.forEach(id => state.favMap.delete(id));
+    toast(`Removed ${removed} from favorites`, 'success');
+    setBulkActive(false);
+    render();
+    return;
+  }
+
+  /* ---- Add to playlist (any video-id scope) ---- */
+  if (action === 'playlist') {
     await bulkAddToPlaylist(ids);
-  } else if (action === 'remove') {
+    return;
+  }
+
+  /* ---- Move to trash (Library / Favorites) ---- */
+  if (action === 'remove') {
     const ok = await confirmDialog({
-      title: `Remove ${ids.length} video${ids.length > 1 ? 's' : ''}?`,
-      message: 'They will be removed from your library. Original files stay on your device.',
-      confirmText: 'Remove',
+      title: `Move ${ids.length} video${ids.length > 1 ? 's' : ''} to Recently deleted?`,
+      message: `They will stay in Recently deleted for 30 days and can be restored anytime. Original files stay on your device.`,
+      confirmText: 'Move to bin',
       danger: true
     });
     if (!ok) return;
-    for (const id of ids) {
-      await dbDel('videos', id);
-      await dbDel('files', id).catch(() => {});
-      await dbDel('thumbnails', id).catch(() => {});
-      await dbDel('history', id).catch(() => {});
-      await dbDel('favorites', id).catch(() => {});
-      for (const pl of state.playlists) {
-        if (pl.videoIds.includes(id)) {
-          pl.videoIds = pl.videoIds.filter(x => x !== id);
-          await dbPut('playlists', pl);
-        }
-      }
-      state.videos = state.videos.filter(x => x.id !== id);
-      state.videoMap.delete(id);
-      state.thumbs.delete(id);
-      state.histMap.delete(id);
-      state.favMap.delete(id);
-      state.history = state.history.filter(h => h.videoId !== id);
-      state.favorites = state.favorites.filter(f => f.videoId !== id);
-    }
-    toast(`Removed ${ids.length} video${ids.length > 1 ? 's' : ''}`, 'success');
+    let moved = 0;
+    for (const id of ids) { if (await moveToTrash(id)) moved++; }
+    toast(`Moved ${moved} video${moved === 1 ? '' : 's'} to Recently deleted`, 'success');
     setBulkActive(false);
     render();
+    return;
+  }
+
+  /* ---- Remove from history ---- */
+  if (action === 'remove-history') {
+    let removed = 0;
+    for (const id of ids) {
+      await dbDel('history', id).catch(() => {});
+      state.histMap.delete(id);
+      removed++;
+    }
+    state.history = state.history.filter(h => !ids.includes(h.videoId));
+    toast(`Removed ${removed} from history`, 'success');
+    setBulkActive(false);
+    render();
+    return;
+  }
+
+  /* ---- Restore from trash ---- */
+  if (action === 'restore') {
+    let ok = 0;
+    for (const id of ids) { if (await restoreFromTrash(id)) ok++; }
+    toast(`Restored ${ok} video${ok === 1 ? '' : 's'}`, ok ? 'success' : 'error');
+    setBulkActive(false);
+    render();
+    return;
+  }
+
+  /* ---- Delete forever from trash ---- */
+  if (action === 'delete-forever') {
+    const confirm = await confirmDialog({
+      title: `Delete ${ids.length} video${ids.length > 1 ? 's' : ''} forever?`,
+      message: `This cannot be undone.`,
+      confirmText: 'Delete forever',
+      danger: true
+    });
+    if (!confirm) return;
+    for (const id of ids) await permanentlyDeleteFromTrash(id);
+    toast(`Permanently deleted ${ids.length} video${ids.length === 1 ? '' : 's'}`);
+    setBulkActive(false);
+    render();
+    return;
   }
 }
 
@@ -1876,7 +2043,15 @@ const Player = {
       this._resizeHandler = null;
     }
     this._carryLock = false;
-    if (this.root) { this.root.classList.add('hidden'); this.root.innerHTML = ''; }
+    /* release the hidden preview <video> before tearing down the DOM */
+if (this.root) {
+  const pv = this.root.querySelector('#pl-scrub-video');
+  if (pv) {
+    try { pv.pause(); pv.removeAttribute('src'); pv.load(); } catch (_) {}
+  }
+  this.root.classList.add('hidden');
+  this.root.innerHTML = '';
+}
     this.isOpen = false;
     this.rec = null;
     this.video = null;
@@ -2110,14 +2285,28 @@ const Player = {
         <!-- BOTTOM CONTROLS -->
         <div class="pl-controls pl-bottom absolute bottom-0 inset-x-0 z-30 pb-[max(12px,env(safe-area-inset-bottom))] pt-10" data-controls>
           <div class="px-3 md:px-5">
-            <div id="pl-seek" class="relative h-7 flex items-center cursor-pointer select-none touch-none group">
-              <div id="pl-seek-tooltip" class="hidden md:block absolute -top-9 -translate-x-1/2 px-2 py-1 rounded-md bg-black/90 border border-white/10 text-[10.5px] font-medium tabular-nums text-white opacity-0 transition-opacity pointer-events-none" style="left:0%">0:00</div>
-              <div class="relative w-full h-[3px] rounded-full bg-white/25 group-hover:h-[5px] transition-all">
-                <div id="pl-buf" class="absolute inset-y-0 left-0 bg-white/25 rounded-full" style="width:0%"></div>
-                <div id="pl-prog" class="absolute inset-y-0 left-0 bg-accent rounded-full" style="width:0%"></div>
-                <div id="pl-thumb" class="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-white shadow-md shadow-black/40 -ml-1.5" style="left:0%"></div>
-              </div>
-            </div>
+<div id="pl-seek" class="relative h-7 flex items-center cursor-pointer select-none touch-none group">
+  <!-- live thumbnail scrub preview -->
+  <div id="pl-scrub-preview"
+       class="hidden absolute bottom-full mb-3 left-0 z-50 pointer-events-none"
+       style="transform: translateX(-50%);">
+    <div class="relative rounded-lg overflow-hidden border border-white/25 shadow-2xl shadow-black/80 bg-black"
+         style="width: 160px; height: 90px;">
+      <video id="pl-scrub-video" class="block w-full h-full object-cover"
+             muted playsinline preload="auto"></video>
+      <div class="absolute bottom-0 inset-x-0 bg-gradient-to-t from-black/90 to-transparent px-2 py-1">
+        <p id="pl-scrub-time" class="text-[10.5px] font-semibold tabular-nums text-white text-center">0:00</p>
+      </div>
+    </div>
+    <div class="absolute left-1/2 -bottom-1 -translate-x-1/2 w-2 h-2 bg-white/90 rotate-45 ring-1 ring-black/40"></div>
+  </div>
+
+  <div class="relative w-full h-[3px] rounded-full bg-white/25 group-hover:h-[5px] transition-all">
+    <div id="pl-buf" class="absolute inset-y-0 left-0 bg-white/25 rounded-full" style="width:0%"></div>
+    <div id="pl-prog" class="absolute inset-y-0 left-0 bg-accent rounded-full" style="width:0%"></div>
+    <div id="pl-thumb" class="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-white shadow-md shadow-black/40 -ml-1.5" style="left:0%"></div>
+  </div>
+</div>
             <div class="flex items-center gap-1 md:gap-2 mt-0.5">
               <button data-pact="toggle" class="w-9 h-9 grid place-items-center rounded-full text-white/85 hover:bg-white/10 transition">
                 <span data-state="play"><i data-lucide="play" class="w-[18px] h-[18px] fill-white"></i></span>
@@ -2597,61 +2786,132 @@ onEnded() {
   this.showControls();
 },
 
-  bindSeek() {
-    const bar = $('#pl-seek', this.root);
-    if (!bar) return;
-    let dragging = false;
-    const setFromEvent = (clientX, commit) => {
-      const rect = bar.getBoundingClientRect();
-      const pct = clamp((clientX - rect.left) / rect.width, 0, 1);
-      const dur = this.video.duration || 0;
-      const prog = $('#pl-prog', this.root);
-      const thumb = $('#pl-thumb', this.root);
-      const cur = $('#pl-cur', this.root);
-      if (prog) prog.style.width = (pct * 100) + '%';
-      if (thumb) thumb.style.left = (pct * 100) + '%';
-      if (cur) cur.textContent = fmtTime(pct * dur);
-      if (commit && dur) {
-        try { this.video.currentTime = pct * dur; } catch (_) {}
-      }
-    };
-    bar.addEventListener('pointerdown', (e) => {
-      dragging = true;
-      bar.setPointerCapture && bar.setPointerCapture(e.pointerId);
-      setFromEvent(e.clientX, false);
+bindSeek() {
+  const bar = $('#pl-seek', this.root);
+  if (!bar) return;
+
+  const previewBox  = $('#pl-scrub-preview', this.root);
+  const previewVid  = $('#pl-scrub-video', this.root);
+  const previewTime = $('#pl-scrub-time', this.root);
+
+  /* feed the same blob into a hidden second <video> */
+  if (previewVid && this.objectUrl) {
+    previewVid.muted = true;
+    previewVid.playsInline = true;
+    previewVid.preload = 'auto';
+    previewVid.src = this.objectUrl;
+    try { previewVid.pause(); } catch (_) {}
+  }
+
+  let dragging     = false;
+  let lastSeekAt   = 0;
+  let previewReady = !!(previewVid && previewVid.readyState >= 1);
+  if (previewVid) {
+    previewVid.addEventListener('loadedmetadata', () => { previewReady = true; });
+  }
+
+  const getPct = (clientX) => {
+    const rect = bar.getBoundingClientRect();
+    return clamp((clientX - rect.left) / rect.width, 0, 1);
+  };
+
+  /* position the floating box above the cursor / finger */
+  const positionPreview = (clientX) => {
+    if (!previewBox) return;
+    const rect = bar.getBoundingClientRect();
+    const pw   = previewBox.offsetWidth || 160;
+    let leftPx = clientX - rect.left;
+    leftPx = clamp(leftPx, pw / 2, Math.max(pw / 2, rect.width - pw / 2));
+    previewBox.style.left = leftPx + 'px';
+    previewBox.style.transform = 'translateX(-50%)';
+  };
+
+  /* throttled seek of the preview <video> */
+  const seekPreview = (t) => {
+    if (!previewVid || !previewReady) return;
+    const now = Date.now();
+    if (now - lastSeekAt < 60) return;
+    lastSeekAt = now;
+    const dur = previewVid.duration || this.video.duration || 0;
+    if (!isFinite(dur) || dur <= 0) return;
+    const target = clamp(t, 0, Math.max(0, dur - 0.1));
+    try { previewVid.currentTime = target; } catch (_) {}
+  };
+
+  const showPreviewAt = (clientX, pct, dur) => {
+    if (!previewBox) return;
+    previewBox.classList.remove('hidden');
+    positionPreview(clientX);
+    if (previewTime) previewTime.textContent = fmtTime(pct * dur);
+    seekPreview(pct * dur);
+  };
+
+  const hidePreview = () => {
+    if (previewBox) previewBox.classList.add('hidden');
+  };
+
+  /* full scrub — updates progress bar, thumb, current-time AND preview */
+  const updateScrub = (clientX, commit) => {
+    const pct = getPct(clientX);
+    const dur = this.video.duration || 0;
+
+    const prog  = $('#pl-prog',  this.root);
+    const thumb = $('#pl-thumb', this.root);
+    const cur   = $('#pl-cur',   this.root);
+    if (prog)  prog.style.width  = (pct * 100) + '%';
+    if (thumb) thumb.style.left  = (pct * 100) + '%';
+    if (cur)   cur.textContent   = fmtTime(pct * dur);
+
+    showPreviewAt(clientX, pct, dur);
+
+    if (commit && dur && isFinite(dur)) {
+      try { this.video.currentTime = pct * dur; } catch (_) {}
+    }
+  };
+
+  /* hover-only — shows preview without disturbing the progress bar */
+  const updateHoverPreview = (clientX) => {
+    const pct = getPct(clientX);
+    const dur = this.video.duration || 0;
+    showPreviewAt(clientX, pct, dur);
+  };
+
+  bar.addEventListener('pointerdown', (e) => {
+    clearTimeout(this.hideTimer);              /* don't auto-hide mid-drag */
+    dragging = true;
+    bar.setPointerCapture && bar.setPointerCapture(e.pointerId);
+    updateScrub(e.clientX, false);
+    e.stopPropagation();
+  });
+
+  bar.addEventListener('pointermove', (e) => {
+    if (dragging) {
+      updateScrub(e.clientX, false);
       e.stopPropagation();
-    });
-    bar.addEventListener('pointermove', (e) => {
-      if (dragging) {
-        setFromEvent(e.clientX, false);
-        e.stopPropagation();
-        return;
-      }
-      // desktop hover tooltip
-      const rect = bar.getBoundingClientRect();
-      const pct = clamp((e.clientX - rect.left) / rect.width, 0, 1);
-      const dur = this.video.duration || 0;
-      const tip = $('#pl-seek-tooltip', this.root);
-      if (tip) {
-        tip.style.left = (pct * 100) + '%';
-        tip.style.opacity = '1';
-        tip.textContent = fmtTime(pct * dur);
-      }
-    });
-    bar.addEventListener('pointerleave', () => {
-      const tip = $('#pl-seek-tooltip', this.root);
-      if (tip) tip.style.opacity = '0';
-    });
-    const end = (e) => {
-      if (!dragging) return;
-      dragging = false;
-      setFromEvent(e.clientX, true);
-      this.showControls();
-      e.stopPropagation();
-    };
-    bar.addEventListener('pointerup', end);
-    bar.addEventListener('pointercancel', end);
-  },
+      return;
+    }
+    /* desktop hover — preview only, no progress-bar movement */
+    if (e.pointerType === 'mouse') {
+      clearTimeout(this.hideTimer);
+      updateHoverPreview(e.clientX);
+    }
+  });
+
+  bar.addEventListener('pointerleave', () => {
+    if (!dragging) hidePreview();
+  });
+
+  const end = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    updateScrub(e.clientX, true);
+    hidePreview();
+    this.showControls();
+    e.stopPropagation();
+  };
+  bar.addEventListener('pointerup', end);
+  bar.addEventListener('pointercancel', end);
+},
 
   bindGestures() {
     const layer = $('#pl-gesture', this.root);
@@ -3440,6 +3700,7 @@ function viewHistory() {
             ${totalEntries} entr${totalEntries === 1 ? 'y' : 'ies'}${watchTimeStr !== '0m' ? ' · ' + watchTimeStr + ' watched' : ''}
           </p>
         </div>
+        ${totalEntries ? bulkSelectBtnHTML() : ''}
         ${totalEntries ? `<button data-action="clear-history" class="h-9 px-3 rounded-lg border border-line text-[12px] font-medium text-white/70 hover:bg-red-500/10 hover:text-red-300 hover:border-red-500/30 transition flex items-center gap-1.5">
           <i data-lucide="trash-2" class="w-3.5 h-3.5"></i> Clear
         </button>` : ''}
@@ -3568,7 +3829,14 @@ function viewHistory() {
           const pct = h.duration ? clamp((h.position / h.duration) * 100, 0, 100) : 0;
           const isDone = !!h.completed;
           return `
-            <div class="group flex items-center gap-3 p-2 rounded-xl hover:bg-white/[0.035] transition">
+            <div class="group flex items-center gap-3 p-2 rounded-xl hover:bg-white/[0.035] transition"
+                 data-bulk-id="${v.id}">
+              ${bulkState.active ? `
+                <span class="w-7 h-7 shrink-0 rounded-full grid place-items-center transition
+                             ${bulkState.selected.has(v.id) ? 'bg-accent' : 'bg-black/40 border-2 border-white/40'}">
+                  ${bulkState.selected.has(v.id) ? '<i data-lucide="check" class="w-4 h-4 text-white"></i>' : ''}
+                </span>
+              ` : ''}
               <div class="relative w-[108px] md:w-[132px] shrink-0 aspect-video rounded-lg overflow-hidden bg-[#15151a] cursor-pointer ring-1 ring-white/[0.04]"
                    data-action="play" data-id="${v.id}">
                 ${thumbHTML(v)}
@@ -3598,10 +3866,10 @@ function viewHistory() {
                   </div>
                 ` : ''}
               </div>
-              <button data-action="history-remove" data-id="${v.id}" title="Remove from history"
+              ${bulkState.active ? '' : `<button data-action="history-remove" data-id="${v.id}" title="Remove from history"
                 class="w-8 h-8 shrink-0 grid place-items-center rounded-full text-white/30 hover:text-red-400 hover:bg-red-500/10 transition">
                 <i data-lucide="x" class="w-4 h-4"></i>
-              </button>
+              </button>`}
             </div>`;
         }).join('')}
       </div>
@@ -3643,6 +3911,7 @@ function viewFavorites() {
             ${all.length} video${all.length === 1 ? '' : 's'}${totalDur ? ' · ' + fmtTime(totalDur) : ''}
           </p>
         </div>
+        ${all.length ? bulkSelectBtnHTML() : ''}
       </div>
       ${all.length ? `<div class="px-4 md:px-8 pb-3">
         <div class="relative">
@@ -3743,6 +4012,144 @@ function viewFavorites() {
     ${statsHtml}
     ${bodyHtml}
   </div>`;
+}
+
+/* ----------------------------- RECENTLY DELETED -------------------------- */
+function viewTrash() {
+  const items     = state.trash.slice().sort((a, b) => b.deletedAt - a.deletedAt);
+  const totalSize = items.reduce((s, t) => s + ((t.video && t.video.size) || 0), 0);
+
+  const header = `
+    <header class="sticky top-0 z-30 bg-bg/90 backdrop-blur-xl border-b border-line/60">
+      <div class="flex items-center gap-2 px-2 md:px-8 h-14">
+        <div class="md:hidden">${iconBtn('chevron-left', 'data-action="back"')}</div>
+        <div class="min-w-0 flex-1 pl-1">
+          <h1 class="text-[17px] md:text-[19px] font-semibold tracking-tight leading-none">Recently deleted</h1>
+          <p class="text-[10.5px] text-muted leading-none mt-1">
+            ${items.length} item${items.length === 1 ? '' : 's'}${totalSize ? ' · ' + fmtSize(totalSize) : ''} · auto-removed after 30 days
+          </p>
+        </div>
+        ${items.length ? bulkSelectBtnHTML() : ''}
+        ${items.length ? `
+          <button data-action="empty-trash"
+            class="h-9 px-3 rounded-lg border border-red-500/20 bg-red-500/[0.06] text-[12px] font-medium text-red-300 hover:bg-red-500/10 hover:border-red-500/30 transition flex items-center gap-1.5">
+            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i> Empty bin
+          </button>` : ''}
+      </div>
+    </header>`;
+
+  /* ---------- empty state ---------- */
+  if (!items.length) {
+    return header + `
+      <div class="flex flex-col items-center text-center py-20 px-6 fade-in">
+        <div class="relative w-24 h-24 rounded-[28px] border border-line bg-panel grid place-items-center mb-6">
+          <div class="absolute inset-0 rounded-[28px] bg-accent/15 blur-2xl -z-10"></div>
+          <i data-lucide="trash-2" class="w-10 h-10 text-white/25"></i>
+        </div>
+        <h3 class="text-[18px] font-semibold tracking-tight">Your bin is empty</h3>
+        <p class="mt-2 text-[13px] text-muted max-w-[280px] leading-relaxed">
+          Videos you remove from your library will appear here for 30 days before being permanently deleted. You can restore them anytime.
+        </p>
+        <button data-action="go" data-href="#/library"
+          class="mt-7 h-12 px-6 rounded-xl bg-accent hover:bg-accent2 active:scale-[0.98] transition text-[14px] font-semibold flex items-center gap-2 shadow-lg shadow-accent/20">
+          <i data-lucide="library" class="w-4 h-4"></i> Browse library
+        </button>
+        <div class="mt-8 grid grid-cols-3 gap-2.5 w-full max-w-sm">
+          <div class="rounded-xl border border-line bg-panel/70 px-2 py-3">
+            <i data-lucide="rotate-ccw" class="w-4 h-4 text-accent mx-auto"></i>
+            <p class="text-[10.5px] text-white/75 mt-1.5 font-medium">Restore</p>
+          </div>
+          <div class="rounded-xl border border-line bg-panel/70 px-2 py-3">
+            <i data-lucide="clock" class="w-4 h-4 text-accent mx-auto"></i>
+            <p class="text-[10.5px] text-white/75 mt-1.5 font-medium">30 days</p>
+          </div>
+          <div class="rounded-xl border border-line bg-panel/70 px-2 py-3">
+            <i data-lucide="shield" class="w-4 h-4 text-accent mx-auto"></i>
+            <p class="text-[10.5px] text-white/75 mt-1.5 font-medium">Private</p>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  /* ---------- cards ---------- */
+  const cards = items.map(t => {
+    const v        = t.video;
+    const left     = daysLeftInTrash(t.deletedAt);
+    const pctLeft  = clamp((left / TRASH_RETENTION_DAYS) * 100, 0, 100);
+    const urgent   = left < 3;
+    const thumbSrc = t.thumb;
+    const thumbInner = thumbSrc
+      ? `<img src="${thumbSrc}" alt="" loading="lazy" decoding="async"
+             class="w-full h-full object-cover opacity-75 group-hover:opacity-100 transition duration-200" />`
+      : `<div class="w-full h-full grid place-items-center bg-gradient-to-br from-[#1b1b22] to-[#101015]">
+           <i data-lucide="film" class="w-6 h-6 text-white/20"></i>
+         </div>`;
+
+    const daysText = left <= 0
+      ? 'Expired'
+      : left < 1
+        ? 'Less than a day left'
+        : `${Math.floor(left)} day${Math.floor(left) === 1 ? '' : 's'} left`;
+
+    return `
+      <div class="group" data-trash-id="${t.id}" data-bulk-id="${t.id}">
+        <div class="relative aspect-video rounded-xl overflow-hidden bg-[#15151a] ring-1 ${bulkState.active && bulkState.selected.has(t.id) ? 'ring-2 ring-accent' : 'ring-white/[0.04]'} shadow-lg shadow-black/20">
+          ${thumbInner}
+          <div class="absolute inset-0 bg-gradient-to-t from-black/75 via-black/10 to-transparent"></div>
+
+          ${bulkState.active ? `
+            <div class="absolute inset-0 ${bulkState.selected.has(t.id) ? 'bg-accent/20' : 'bg-black/20'} transition"></div>
+            <span class="absolute top-2 left-2 w-7 h-7 rounded-full grid place-items-center transition-all
+                         ${bulkState.selected.has(t.id) ? 'bg-accent shadow-lg shadow-accent/40 scale-105' : 'bg-black/50 backdrop-blur border-2 border-white/70'}">
+              ${bulkState.selected.has(t.id) ? '<i data-lucide="check" class="w-4 h-4 text-white"></i>' : ''}
+            </span>
+          ` : `<span class="absolute top-1.5 left-1.5 px-2 py-0.5 rounded-md backdrop-blur text-[10px] font-semibold text-white/95 tabular-nums
+                       ${urgent ? 'bg-red-500/90 shadow-lg shadow-red-500/30' : 'bg-black/70'}">
+            ${daysText}
+          </span>`}
+
+          ${v.duration ? `<span class="absolute bottom-1.5 right-1.5 px-1.5 py-[2px] rounded-md bg-black/80 text-[10.5px] font-medium tabular-nums text-white/90">${fmtTime(v.duration)}</span>` : ''}
+
+          <div class="absolute left-0 right-0 bottom-0 h-[3px] bg-white/15">
+            <div class="h-full ${urgent ? 'bg-red-500' : 'bg-accent'} transition-all" style="width:${pctLeft}%"></div>
+          </div>
+        </div>
+
+        <div class="mt-2.5">
+          <p class="text-[13px] font-medium leading-snug line-clamp-2 text-white/92">${esc(v.name)}</p>
+          <p class="mt-1 text-[11px] text-muted truncate">
+            Deleted ${esc(trashDeletedText(t.deletedAt))}${v.size ? ' · ' + fmtSize(v.size) : ''}
+          </p>
+        </div>
+
+        ${bulkState.active ? '' : `<div class="mt-2 flex items-center gap-1.5">
+          <button data-action="trash-restore" data-id="${t.id}"
+            class="flex-1 h-9 rounded-lg bg-accent hover:bg-accent2 active:scale-[0.98] transition text-[12px] font-semibold text-white flex items-center justify-center gap-1.5 shadow-sm shadow-accent/25">
+            <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i> Restore
+          </button>
+          <button data-action="trash-delete" data-id="${t.id}" title="Delete forever"
+            class="w-9 h-9 grid place-items-center rounded-lg border border-line text-white/50 hover:text-red-400 hover:bg-red-500/10 hover:border-red-500/30 transition">
+            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+          </button>
+        </div>`}
+      </div>`;
+  }).join('');
+
+  return header + `
+    <div class="pt-4 pb-8 fade-in">
+      <div class="px-4 md:px-8">
+        <div class="rounded-xl border border-amber-500/20 bg-amber-500/[0.06] px-3.5 py-2.5 mb-5 flex items-start gap-2.5">
+          <i data-lucide="info" class="w-3.5 h-3.5 text-amber-400 mt-0.5 shrink-0"></i>
+          <p class="text-[11.5px] leading-relaxed text-amber-200/85">
+            Videos in the bin are kept for <b class="text-amber-200">${TRASH_RETENTION_DAYS} days</b>, then permanently removed.
+            Original files on your device are never touched.
+          </p>
+        </div>
+        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-x-3 gap-y-6 md:gap-x-5 md:gap-y-8">
+          ${cards}
+        </div>
+      </div>
+    </div>`;
 }
 
 /* -------------------------------- SETTINGS ------------------------------- */
@@ -3855,6 +4262,22 @@ function viewSettings() {
               <option value="played" ${s.defaultSort === 'played' ? 'selected' : ''}>Recently played</option>
             </select>`, 'arrow-down-up')}
           ${settingRow('Confirm before removing', 'Ask before deleting from library', toggleControl('confirmRemove', s.confirmRemove), 'shield')}
+          <button data-action="go" data-href="#/trash" class="w-full flex items-center gap-3 py-3.5 text-left">
+            <div class="w-8 h-8 rounded-lg bg-white/[0.04] border border-line/60 grid place-items-center shrink-0">
+              <i data-lucide="trash-2" class="w-4 h-4 text-white/45"></i>
+            </div>
+            <div class="min-w-0 flex-1">
+              <p class="text-[13.5px] font-medium">Recently deleted</p>
+              <p class="text-[11.5px] text-muted mt-0.5">
+                ${state.trash.length
+                  ? state.trash.length + ' video' + (state.trash.length === 1 ? '' : 's') + ' · auto-removed after 30 days'
+                  : 'Bin is empty · restore window is 30 days'}
+              </p>
+            </div>
+            <span class="flex items-center gap-1.5 text-[12px] text-white/65">
+              Open <i data-lucide="chevron-right" class="w-4 h-4 text-white/25"></i>
+            </span>
+          </button>
         </div>
       </section>
 
@@ -3946,8 +4369,9 @@ async function updateStorageUsage() {
   const pctNode = $('#storage-pct');
   if (!node) return;
 
-  /* Sum of file sizes we already track — always available, no API needed */
-  const libraryBytes = state.videos.reduce((s, v) => s + (v.size || 0), 0);
+  /* Sum of file sizes we already track — includes the recycle bin */
+  const libraryBytes = state.videos.reduce((s, v) => s + (v.size || 0), 0)
+                     + state.trash.reduce((s, t) => s + ((t.video && t.video.size) || 0), 0);
 
   /* Try the precise browser estimate (secure context only) */
   let est = null;
@@ -4020,7 +4444,11 @@ const NAV_ITEMS = [
 function renderNav(active) {
   const side = $('#side-nav');
   if (side) {
-    const items = [...NAV_ITEMS, { key: 'favorites', label: 'Favorites', icon: 'heart', href: '#/favorites' }, { key: 'settings', label: 'Settings', icon: 'settings', href: '#/settings' }];
+    const items = [...NAV_ITEMS,
+      { key: 'favorites', label: 'Favorites',         icon: 'heart',   href: '#/favorites' },
+      { key: 'trash',     label: 'Recently deleted',  icon: 'trash-2', href: '#/trash' },
+      { key: 'settings',  label: 'Settings',          icon: 'settings', href: '#/settings' }
+    ];
     side.innerHTML = items.map(it => `
       <a href="${it.href}" class="flex items-center gap-3 px-3 h-11 rounded-xl text-[13.5px] font-medium transition
         ${active === it.key ? 'bg-accent/12 text-white' : 'text-white/60 hover:text-white hover:bg-white/[0.05]'}">
@@ -4046,8 +4474,8 @@ function render() {
   let view = parts[0] || 'home';
   const param = parts[1] || null;
 
-  /* exit bulk-select if we're no longer on Library */
-  if (bulkState.active && view !== 'library') {
+  /* exit bulk-select if we've navigated away from the page where it started */
+  if (bulkState.active && view !== bulkState.scope) {
     bulkState.active = false;
     bulkState.selected.clear();
     document.body.classList.remove('bulk-active');
@@ -4079,6 +4507,10 @@ function render() {
     case 'playlist':  viewEl.innerHTML = viewPlaylistDetail(param); break;
     case 'history':   viewEl.innerHTML = viewHistory(); break;
     case 'favorites': viewEl.innerHTML = viewFavorites(); break;
+    case 'trash':
+      purgeExpiredTrash();
+      viewEl.innerHTML = viewTrash();
+      break;
     case 'settings':  viewEl.innerHTML = viewSettings(); updateStorageUsage(); break;
     default:          viewEl.innerHTML = viewHome(); view = 'home';
   }
@@ -4116,6 +4548,7 @@ function bindViewEvents(view) {
         const s2 = $('#fav-search');
         if (s2) { s2.focus(); s2.setSelectionRange(s2.value.length, s2.value.length); }
         window.scrollTo(0, scrollY);
+        if (bulkState.active) updateBulkBar();
       });
     }
   }
@@ -4266,6 +4699,45 @@ document.addEventListener('click', async (e) => {
       playPlaylist(id);
       break;
 
+    /* ---------- trash actions ---------- */
+    case 'trash-restore': {
+      const ok = await restoreFromTrash(id);
+      toast(ok ? 'Video restored to library' : 'Could not restore this video', ok ? 'success' : 'error');
+      render();
+      break;
+    }
+
+    case 'trash-delete': {
+      const entry = state.trashMap.get(id);
+      if (!entry) break;
+      const ok = await confirmDialog({
+        title: 'Delete forever?',
+        message: `“${entry.video.name}” will be permanently removed. This cannot be undone.`,
+        confirmText: 'Delete forever',
+        danger: true
+      });
+      if (!ok) break;
+      await permanentlyDeleteFromTrash(id);
+      toast('Video permanently deleted');
+      render();
+      break;
+    }
+
+    case 'empty-trash': {
+      if (!state.trash.length) break;
+      const ok = await confirmDialog({
+        title: 'Empty Recently deleted?',
+        message: `All ${state.trash.length} video${state.trash.length === 1 ? '' : 's'} in the bin will be permanently removed. This cannot be undone.`,
+        confirmText: 'Empty bin',
+        danger: true
+      });
+      if (!ok) break;
+      await emptyTrash();
+      toast('Bin emptied', 'success');
+      render();
+      break;
+    }
+
     case 'rename-playlist':
       renamePlaylist(id);
       break;
@@ -4365,6 +4837,119 @@ document.addEventListener('change', (e) => {
   saveSettings();
 });
 
+/* ------------------------------ trash ops ------------------------------- */
+async function moveToTrash(id) {
+  const v = state.videoMap.get(id);
+  if (!v) return false;
+
+  /* grab the file blob (only blob-stored videos have one) */
+  let fileBlob = null;
+  try {
+    const row = await dbGet('files', id);
+    if (row && row.blob) fileBlob = row.blob;
+  } catch (_) {}
+
+  const entry = {
+    id,
+    deletedAt: Date.now(),
+    video: v,                                   // full video record (handle preserved)
+    fileBlob,                                   // blob | null
+    thumb: state.thumbs.get(id) || null,        // data URL | null
+    history: state.histMap.get(id) || null,
+    favorite: state.favMap.get(id) || null,
+    playlistIds: state.playlists.filter(p => p.videoIds.includes(id)).map(p => p.id)
+  };
+
+  try {
+    await dbPut('trash', entry);
+  } catch (err) {
+    console.warn('Could not move to trash', err);
+    return false;
+  }
+
+  /* remove from every live store */
+  await dbDel('videos', id).catch(() => {});
+  await dbDel('files', id).catch(() => {});
+  await dbDel('thumbnails', id).catch(() => {});
+  await dbDel('history', id).catch(() => {});
+  await dbDel('favorites', id).catch(() => {});
+
+  for (const pl of state.playlists) {
+    if (pl.videoIds.includes(id)) {
+      pl.videoIds = pl.videoIds.filter(x => x !== id);
+      await dbPut('playlists', pl).catch(() => {});
+    }
+  }
+
+  /* update in-memory state */
+  state.videos    = state.videos.filter(x => x.id !== id);
+  state.history   = state.history.filter(h => h.videoId !== id);
+  state.favorites = state.favorites.filter(f => f.videoId !== id);
+  state.videoMap.delete(id);
+  state.thumbs.delete(id);
+  state.histMap.delete(id);
+  state.favMap.delete(id);
+  state.trash     = [entry, ...state.trash];
+  state.trashMap.set(id, entry);
+  return true;
+}
+
+async function restoreFromTrash(id) {
+  const entry = state.trashMap.get(id);
+  if (!entry) return false;
+
+  try {
+    await dbPut('videos', entry.video);
+    if (entry.fileBlob) await dbPut('files', { id, blob: entry.fileBlob });
+    if (entry.thumb)    await dbPut('thumbnails', { videoId: id, dataUrl: entry.thumb });
+    if (entry.history)  await dbPut('history', entry.history);
+    if (entry.favorite) await dbPut('favorites', entry.favorite);
+
+    /* re-attach to any playlists that still exist */
+    for (const plId of entry.playlistIds || []) {
+      const pl = state.playlists.find(p => p.id === plId);
+      if (pl && !pl.videoIds.includes(id)) {
+        pl.videoIds.push(id);
+        await dbPut('playlists', pl).catch(() => {});
+      }
+    }
+
+    await dbDel('trash', id);
+  } catch (err) {
+    console.warn('Restore failed', err);
+    return false;
+  }
+
+  await loadAll();
+  return true;
+}
+
+async function permanentlyDeleteFromTrash(id) {
+  if (!state.trashMap.has(id)) return;
+  await dbDel('trash', id).catch(() => {});
+  state.trash = state.trash.filter(t => t.id !== id);
+  state.trashMap.delete(id);
+}
+
+async function emptyTrash() {
+  for (const t of state.trash.slice()) {
+    await dbDel('trash', t.id).catch(() => {});
+  }
+  state.trash = [];
+  state.trashMap.clear();
+}
+
+/* Synchronously drops expired entries from state, cleans DB in background */
+function purgeExpiredTrash() {
+  const now = Date.now();
+  const expired = state.trash.filter(t => (now - t.deletedAt) > TRASH_RETENTION_MS);
+  if (!expired.length) return 0;
+  state.trash = state.trash.filter(t => (now - t.deletedAt) <= TRASH_RETENTION_MS);
+  state.trashMap = new Map(state.trash.map(t => [t.id, t]));
+  expired.forEach(t => dbDel('trash', t.id).catch(() => {}));
+  return expired.length;
+}
+
 /* ------------------------------ video ops ------------------------------- */
 async function toggleFavorite(id) {
   if (state.favMap.has(id)) {
@@ -4399,32 +4984,16 @@ async function removeVideo(id) {
   if (!v) return;
   if (state.settings.confirmRemove) {
     const ok = await confirmDialog({
-      title: 'Remove from library?',
-      message: `“${v.name}” will be removed from Playora. The original file on your device will not be deleted.`,
-      confirmText: 'Remove',
+      title: 'Move to Recently deleted?',
+      message: `“${v.name}” will move to Recently deleted. You can restore it within 30 days. The original file on your device is never touched.`,
+      confirmText: 'Move to bin',
       danger: true
     });
     if (!ok) return;
   }
-  await dbDel('videos', id);
-  await dbDel('files', id).catch(() => {});
-  await dbDel('thumbnails', id).catch(() => {});
-  await dbDel('history', id).catch(() => {});
-  await dbDel('favorites', id).catch(() => {});
-  for (const pl of state.playlists) {
-    if (pl.videoIds.includes(id)) {
-      pl.videoIds = pl.videoIds.filter(x => x !== id);
-      await dbPut('playlists', pl);
-    }
-  }
-  state.videos = state.videos.filter(x => x.id !== id);
-  state.videoMap.delete(id);
-  state.thumbs.delete(id);
-  state.histMap.delete(id);
-  state.favMap.delete(id);
-  state.history = state.history.filter(h => h.videoId !== id);
-  state.favorites = state.favorites.filter(f => f.videoId !== id);
-  toast('Removed from library');
+  const moved = await moveToTrash(id);
+  if (moved) toast('Moved to Recently deleted');
+  else       toast('Could not move this video', 'error');
   render();
 }
 
@@ -4873,6 +5442,8 @@ async function boot() {
   loadSettings();
   applyTheme(state.settings.theme);
   await loadAll();
+  const purged = purgeExpiredTrash();
+  if (purged > 0) console.log(`[Playora] Auto-purged ${purged} expired trash item(s)`);
   PWA.init();
 
   /* Honor the “Import” shortcut from the installed app / long-press menu */
