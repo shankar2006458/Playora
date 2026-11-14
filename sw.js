@@ -1,5 +1,5 @@
 /* Playora service worker — caches the shell, ignores video streams */
-const VERSION  = 'v1';
+const VERSION  = 'v2';
 const SHELL    = `playora-shell-${VERSION}`;
 const RUNTIME  = `playora-runtime-${VERSION}`;
 
@@ -60,30 +60,52 @@ self.addEventListener('fetch', (e) => {
   }
 
   /* Same-origin assets → cache-first, refresh in background */
-  if (url.origin === self.location.origin) {
-    e.respondWith(
-      caches.match(req).then((hit) => {
-        const network = fetch(req).then((res) => {
-          if (res && res.ok) caches.open(SHELL).then((c) => c.put(req, res.clone()));
-          return res;
-        }).catch(() => hit);
-        return hit || network;
-      })
-    );
-    return;
-  }
-
-  /* Cross-origin (fonts, Tailwind, Lucide) → stale-while-revalidate */
+if (url.origin === self.location.origin) {
   e.respondWith(
-    caches.open(RUNTIME).then(async (cache) => {
-      const hit = await cache.match(req);
-      const network = fetch(req).then((res) => {
-        if (res && res.ok && (res.type === 'basic' || res.type === 'cors')) {
-          cache.put(req, res.clone());
+    caches.match(req).then((hit) => {
+      if (hit) {
+        // cache hit → refresh in background, but keep worker alive
+        e.waitUntil(
+          fetch(req).then((res) => {
+            if (res && res.ok) {
+              const copy = res.clone();                    // ✅ clone NOW
+              caches.open(SHELL)
+                .then((c) => c.put(req, copy))
+                .catch(() => {});
+            }
+            return res;
+          }).catch(() => {})
+        );
+        return hit;
+      }
+
+      // cache miss → network, cache the clone, return original
+      return fetch(req).then((res) => {
+        if (res && res.ok) {
+          const copy = res.clone();                        // ✅ clone NOW
+          caches.open(SHELL)
+            .then((c) => c.put(req, copy))
+            .catch(() => {});
         }
         return res;
-      }).catch(() => hit);
-      return hit || network;
+      });
     })
   );
+  return;
+}
+
+/* Cross-origin (fonts, Tailwind, Lucide) → stale-while-revalidate */
+e.respondWith(
+  caches.open(RUNTIME).then(async (cache) => {
+    const hit = await cache.match(req);
+    const network = fetch(req).then((res) => {
+      if (res && res.ok && (res.type === 'basic' || res.type === 'cors')) {
+        const copy = res.clone();                          // clone first
+        cache.put(req, copy).catch(() => {});              // ← RUNTIME, not SHELL
+      }
+      return res;
+    }).catch(() => hit);
+    return hit || network;
+  })
+);
 });
